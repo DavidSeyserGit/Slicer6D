@@ -1,0 +1,44 @@
+# Slicer6D
+
+[![Lint & Test](https://github.com/yourusername/Slicer6D/actions/workflows/pylint.yml/badge.svg)](https://github.com/yourusername/Slicer6D/actions/workflows/pylint.yml)
+[![Open Issues](https://img.shields.io/github/issues/yourusername/Slicer6D?color=orange)](https://github.com/yourusername/Slicer6D/issues)
+[![Last Commit](https://img.shields.io/github/last-commit/yourusername/Slicer6D?color=blue)](https://github.com/yourusername/Slicer6D/commits/main)
+[![License: MIT](https://img.shields.io/github/license/yourusername/Slicer6D?color=green)](LICENSE)
+
+## 🧑‍🔬 About
+
+**Slicer6D** is an academic research project for advanced 3D print slicing and overhang deformation, built with PyQt5 and PyVista.  
+
+- **Overhang detection and deformation**
+- **Custom slicing and G-code generation**
+- **Interactive 3D visualization**
+- **Layer and toolpath analysis**
+
+---
+
+## 🚦 Project Status
+
+> **This is a prototype.**  
+> Expect rapid changes, breaking changes, experimental features, and open issues.  
+> Contributions and feedback are welcome!
+
+---
+
+## 🏗️ Features
+
+- **3D Model Visualization** (STL)
+- **Overhang Analysis** (angle, support distance, ray tracing)
+- **Deformation Tools** (reduce supports)
+- **Custom Slicing** (layer height, infill, G-code)
+- **Layer/Toolpath View** (interactive slider)
+- **Cross-platform** (Linux, Windows, macOS)
+
+---
+
+## 🛠️ Installation
+
+```bash
+git clone https://github.com/yourusername/Slicer6D.git
+cd Slicer6D
+pip install -r requirements.txt
+python main.py
