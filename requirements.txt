@@ -1,4 +1,4 @@
-numpy==2.2.5
+numpy==2.0.0
 PyQt5==5.15.11
 PyQt5_sip==12.17.0
 pyvista==0.45.0
