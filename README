@@ -1,7 +1,7 @@
 # Slicer6D
 
-[![Open Issues](https://img.shields.io/github/issues/DavidSeyserGit/Slicer6D?color=orange)](https://github.com/DavidSeyserGit/Slicer6D/issues)
-[![License: MIT](https://img.shields.io/github/license/DavidSeyserGit/Slicer6D?color=green)](https://github.com/DavidSeyserGit/Slicer6D/blob/main/LICENSE)
+![GitHub Issues or Pull Requests](https://img.shields.io/github/issues/DavidSeyserGit/Slicer6D)
+![GitHub License](https://img.shields.io/github/license/DavidSeyserGit/Slicer6D)
 
 ---
 
@@ -20,3 +20,4 @@ git clone https://github.com/DavidSeyserGit/Slicer6D.git
 cd Slicer6D
 pip install -r requirements.txt
 python main.py
+```
