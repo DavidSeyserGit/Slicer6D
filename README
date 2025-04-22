@@ -1,9 +1,9 @@
 # Slicer6D
 
-[![Lint & Test](https://github.com/DavidSeyserGit/Slicer6D/actions/workflows/pylint.yml/badge.svg)](https://github.com/yourusername/Slicer6D/actions/workflows/pylint.yml)
-[![Open Issues](https://img.shields.io/github/issues/DavidSeyserGit/Slicer6D?color=orange)](https://github.com/yourusername/Slicer6D/issues)
-[![Last Commit](https://img.shields.io/github/last-commit/DavidSeyserGit/Slicer6D?color=blue)](https://github.com/yourusername/Slicer6D/commits/main)
-[![License: MIT](https://img.shields.io/github/license/DavidSeyserGit/Slicer6D?color=green)](LICENSE)
+[![Lint & Test](https://github.com/DavidSeyserGit/Slicer6D/actions/workflows/pylint.yml/badge.svg)](https://github.com/DavidSeyserGit/Slicer6D/actions/workflows/pylint.yml)
+[![Open Issues](https://img.shields.io/github/issues/DavidSeyserGit/Slicer6D?color=orange)](https://github.com/DavidSeyserGit/Slicer6D/issues)
+[![Last Commit](https://img.shields.io/github/last-commit/DavidSeyserGit/Slicer6D?color=blue)](https://github.com/DavidSeyserGit/Slicer6D/commits/main)
+[![License: MIT](https://img.shields.io/github/license/DavidSeyserGit/Slicer6D?color=green)](https://github.com/DavidSeyserGit/Slicer6D/blob/main/LICENSE)
 
 ## 🧑‍🔬 About
 
@@ -38,7 +38,7 @@
 ## 🛠️ Installation
 
 ```bash
-git clone https://github.com/yourusername/Slicer6D.git
+git clone https://github.com/DavidSeyserGit/Slicer6D.git
 cd Slicer6D
 pip install -r requirements.txt
 python main.py
