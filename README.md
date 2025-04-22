@@ -2,6 +2,7 @@
 
 ![GitHub Issues or Pull Requests](https://img.shields.io/github/issues/DavidSeyserGit/Slicer6D)
 ![GitHub License](https://img.shields.io/github/license/DavidSeyserGit/Slicer6D)
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/DavidSeyserGit/Slicer6D/pylint.yml)
 
 ---
 
