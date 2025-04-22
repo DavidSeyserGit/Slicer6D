@@ -97,7 +97,9 @@ class MainWindow(QMainWindow):
 
     def _build_orientation_group(self, parent):
         gb = QGroupBox("Print Orientation")
-        l = QVBoxLayout(gb)
+        layout = QVBoxLayout(gb)
+
+        # -- Preset combo + button
         h = QHBoxLayout()
         h.addWidget(QLabel("Base:"))
         self.orient_combo = QComboBox()
@@ -106,13 +108,51 @@ class MainWindow(QMainWindow):
             "Top (-XY)", "Back (-XZ)", "Other (-YZ)"
         ])
         h.addWidget(self.orient_combo)
-        l.addLayout(h)
-        btn = QPushButton("Set Orientation")
+        btn = QPushButton("Set Preset")
         btn.clicked.connect(self.set_orientation)
-        l.addWidget(btn)
-        self.bed_cb = QCheckBox("Show Bed"); self.bed_cb.setChecked(True)
-        self.bed_cb.stateChanged.connect(self.update_display)
-        l.addWidget(self.bed_cb)
+        h.addWidget(btn)
+        layout.addLayout(h)
+
+        # -- Manual sliders
+        # X rotation
+        hx = QHBoxLayout()
+        hx.addWidget(QLabel("Rotate X:"))
+        self.rot_x_sb = QDoubleSpinBox()
+        self.rot_x_sb.setRange(-180, 180)
+        self.rot_x_sb.setSingleStep(1)
+        self.rot_x_sb.setSuffix("°")
+        self.rot_x_sb.valueChanged.connect(self.apply_manual_rotation)
+        hx.addWidget(self.rot_x_sb)
+        layout.addLayout(hx)
+
+        # Y rotation
+        hy = QHBoxLayout()
+        hy.addWidget(QLabel("Rotate Y:"))
+        self.rot_y_sb = QDoubleSpinBox()
+        self.rot_y_sb.setRange(-180, 180)
+        self.rot_y_sb.setSingleStep(1)
+        self.rot_y_sb.setSuffix("°")
+        self.rot_y_sb.valueChanged.connect(self.apply_manual_rotation)
+        hy.addWidget(self.rot_y_sb)
+        layout.addLayout(hy)
+
+        # Z rotation
+        hz = QHBoxLayout()
+        hz.addWidget(QLabel("Rotate Z:"))
+        self.rot_z_sb = QDoubleSpinBox()
+        self.rot_z_sb.setRange(-180, 180)
+        self.rot_z_sb.setSingleStep(1)
+        self.rot_z_sb.setSuffix("°")
+        self.rot_z_sb.valueChanged.connect(self.apply_manual_rotation)
+        hz.addWidget(self.rot_z_sb)
+        layout.addLayout(hz)
+
+        # Show/hide print bed
+        self.bed_cb = QCheckBox("Show Print Bed")
+        self.bed_cb.setChecked(True)
+        self.bed_cb.stateChanged.connect(self.display_original)
+        layout.addWidget(self.bed_cb)
+
         parent.addWidget(gb)
 
     def _build_overhang_group(self, parent):
@@ -158,12 +198,55 @@ class MainWindow(QMainWindow):
     def load_model(self):
         fn, _ = QFileDialog.getOpenFileName(self, "Open STL", "", "STL Files (*.stl)")
         if not fn: return
-        self.original_mesh = pv.read(fn)
-        self.deformed_mesh = None
+
+        # read mesh
+        self.base_mesh = pv.read(fn)
+        # start out with original == base
+        self.original_mesh = self.base_mesh.copy()
+        self.deformed_mesh  = None
         self.overhang_faces = None
+
+        # reset sliders
+        self.rot_x_sb.setValue(0)
+        self.rot_y_sb.setValue(0)
+        self.rot_z_sb.setValue(0)
+
+        # determine bed & display
         self.print_bed = deformer.determine_print_bed(self.original_mesh)
         self.display_original()
         self.status.showMessage(f"Loaded {os.path.basename(fn)}")
+
+
+    def apply_manual_rotation(self):
+        """Re‐apply manual X/Y/Z rotations to the base mesh."""
+        if not hasattr(self, "base_mesh") or self.base_mesh is None:
+            return
+
+        # Get angles
+        angle_x = self.rot_x_sb.value()
+        angle_y = self.rot_y_sb.value()
+        angle_z = self.rot_z_sb.value()
+
+        # Copy from pristine base
+        m = self.base_mesh.copy()
+
+        # Apply rotations in X → Y → Z order
+        m.rotate_x(angle_x, inplace=True)
+        m.rotate_y(angle_y, inplace=True)
+        m.rotate_z(angle_z, inplace=True)
+
+        # Update state
+        self.original_mesh  = m
+        self.deformed_mesh  = None
+        self.overhang_faces = None
+        self.print_bed     = deformer.determine_print_bed(m)
+        
+        # Redisplay
+        self.display_original()
+        self.status.showMessage(
+            f"Manual rot: X={angle_x:.1f}°, Y={angle_y:.1f}°, Z={angle_z:.1f}°"
+        )
+
 
     def display_original(self):
         self.plotter.clear()
@@ -188,20 +271,65 @@ class MainWindow(QMainWindow):
         self.plotter.add_mesh(plane, color='lightblue', opacity=0.3)
 
     def set_orientation(self):
-        if self.original_mesh is None: return
-        txt = self.orient_combo.currentText()
+        """
+        Rotate the mesh so the face you are currently looking at
+        becomes the new print‐bed (XY plane). Uses the current camera
+        direction to compute the rotation.
+        """
+        if self.original_mesh is None:
+            return
+
+        # 1) Get camera position & focal point
+        cam_pos, cam_focus, _ = self.plotter.camera_position
+        cam_pos   = np.array(cam_pos)
+        cam_focus = np.array(cam_focus)
+
+        # 2) View direction (pointing into the scene)
+        view_dir = cam_focus - cam_pos
+        view_dir /= np.linalg.norm(view_dir)
+
+        # 3) We want to rotate so that view_dir → (0,0,-1)
+        target = np.array([0, 0, -1], dtype=float)
+
+        # 4) Compute rotation axis & angle via Rodrigues' formula
+        axis = np.cross(view_dir, target)
+        axis_len = np.linalg.norm(axis)
+        if axis_len < 1e-6:
+            # already aligned (e.g. top/bottom view)
+            self.status.showMessage("Orientation unchanged (already aligned).")
+            return
+        axis /= axis_len
+
+        # Clamp dot to [-1,1]
+        cosang = np.dot(view_dir, target)
+        cosang = np.clip(cosang, -1.0, 1.0)
+        angle = np.arccos(cosang)
+
+        # Build Rodrigues rotation matrix (3×3)
+        K = np.array([
+            [    0,      -axis[2],  axis[1]],
+            [ axis[2],      0,     -axis[0]],
+            [-axis[1],  axis[0],       0  ]
+        ])
+        R = np.eye(3)*np.cos(angle) \
+            + (1 - np.cos(angle))*np.outer(axis, axis) \
+            + np.sin(angle)*K
+
+        # 5) Build 4×4 homogeneous transform
+        M = np.eye(4)
+        M[:3, :3] = R
+
+        # 6) Apply to a copy of the mesh
         m = self.original_mesh.copy()
-        if txt=="Front (XZ)": m.rotate_x(90)
-        elif txt=="Side (YZ)": m.rotate_y(90)
-        elif txt=="Top (-XY)": m.rotate_x(180)
-        elif txt=="Back (-XZ)": m.rotate_x(-90)
-        elif txt=="Other (-YZ)": m.rotate_y(-90)
-        self.original_mesh = m
-        self.deformed_mesh = None
+        m.transform(M)
+
+        # 7) Update state & redisplay
+        self.original_mesh  = m
+        self.deformed_mesh  = None
         self.overhang_faces = None
-        self.print_bed = deformer.determine_print_bed(m)
+        self.print_bed     = deformer.determine_print_bed(m)
         self.display_original()
-        self.status.showMessage(f"Orientation set to {txt}")
+        self.status.showMessage("Print bed set to current view.")
 
     def detect_overhangs(self):
         """Detect overhang faces (angle‑only + optional ray filtering)."""
