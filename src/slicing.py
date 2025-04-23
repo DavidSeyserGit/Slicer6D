@@ -329,7 +329,7 @@ def generate_gcode_with_infill(z_levels, layer_polygons,
         # ... (rest of footer) ...
         "; End of G-code",
     ]
-    # --- Return both G-code and the collected paths ---
+    # --- Return both G-code and the collected pahs ---
     return "\n".join(gcode_lines), visualization_paths
     # --- End Return ---
 
