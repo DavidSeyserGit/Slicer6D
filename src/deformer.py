@@ -4,9 +4,13 @@ import pyvista as pv
 import vtk
 from math import sqrt
 
+
 def normalize(v):
+    """normalizing normal vector to ground plane """
     n = np.linalg.norm(v)
     return v/(n if n>1e-12 else 1)
+
+
 
 def determine_print_bed(mesh):
     """Return (normal, point) of the print‑bed as the XY plane at mesh.min_z."""

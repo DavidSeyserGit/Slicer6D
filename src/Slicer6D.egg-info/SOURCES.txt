@@ -1,0 +1,9 @@
+LICENSE
+README.md
+pyproject.toml
+src/Slicer6D.egg-info/PKG-INFO
+src/Slicer6D.egg-info/SOURCES.txt
+src/Slicer6D.egg-info/dependency_links.txt
+src/Slicer6D.egg-info/requires.txt
+src/Slicer6D.egg-info/top_level.txt
+tests/test_deformer.py
