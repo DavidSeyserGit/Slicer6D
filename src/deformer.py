@@ -41,18 +41,63 @@ def detect_overhangs(mesh, angle_threshold=45, print_bed=None):
 
 def tetrahedralize_mesh(surface_mesh):
     """
-    Erzeugt ein tetraedrisches Volumenmesh aus einem Oberflächenmesh.
-    Hier wird pyvista's delaunay_3d() genutzt. Beachte, dass der Parameter
-    `alpha` ggf. angepasst werden muss, um alle relevanten Elemente zu erhalten.
+    Creates a tetrahedral volume mesh from a surface mesh using tetgen.
+    Includes fallback to Delaunay 3D.
     """
-    # Erzeuge ein dichtes Punktwolken-Set aus der Oberfläche.
-    points = surface_mesh.points
-    # Für robuste Tetraedrierung kann ein alpha-wert sinnvoll sein; hier als Startwert
-    tet_mesh = surface_mesh.delaunay_3d(alpha=1.0)
-    # Optional: Extrahiere das Volumen (beispielsweise mittels thresholding).
-    tet = tet_mesh.extract_geometry()
-    return tet
+    try:
+        import tetgen
+    except ImportError:
+        print("Error: tetgen library not found. Install with 'pip install tetgen'")
+        print("Falling back to PyVista's Delaunay 3D (may not be volume-preserving or conformal).")
+        try:
+            # Basic Delaunay 3D - alpha might need tuning
+            tet_mesh = surface_mesh.delaunay_3d(alpha=2.0, tol=1e-05, offset=2.5)
+            # Extract the largest connected volume
+            vol = tet_mesh.extract_largest()
+            if vol.n_cells > 0:
+                 print("Using Delaunay 3D fallback.")
+                 return vol.extract_geometry() # Ensure it's UnstructuredGrid
+            else:
+                 print("Error: Delaunay 3D fallback also failed.")
+                 return None
+        except Exception as e_del:
+            print(f"Error during Delaunay 3D fallback: {e_del}")
+            return None
 
+    # Use tetgen
+    points = np.asarray(surface_mesh.points)
+    # Ensure faces are triangles (N=3)
+    if surface_mesh.is_all_triangles():
+        faces_raw = np.asarray(surface_mesh.faces)
+        # Reshape based on PyVista's format (n, v0, v1, v2, n, v0, v1, v2, ...)
+        faces = faces_raw.reshape(-1, 4)[:, 1:] # Extract vertex indices
+    else:
+        print("Warning: Input mesh is not fully triangulated. Attempting triangulation.")
+        surface_mesh = surface_mesh.triangulate()
+        if not surface_mesh.is_all_triangles():
+            print("Error: Triangulation failed. Cannot proceed with tetgen.")
+            return None
+        faces_raw = np.asarray(surface_mesh.faces)
+        faces = faces_raw.reshape(-1, 4)[:, 1:]
+
+    try:
+        tet = tetgen.TetGen(points, faces)
+        # Add switches for quality, volume constraints, etc.
+        # Example: 'pq1.4/0a0.1' (quality mesh, min angle 1.4, max radius-edge ratio 0, min volume constraint 0.1)
+        # Switches: '' (default), 'p' (input PLC), 'q' (quality), 'a' (volume constraint), 'Y' (no boundary split)
+        switches = 'pq1.2' # Basic quality mesh
+        tet.tetrahedralize(order=1, mindihedral=10, minratio=1.5, switches=switches)
+        grid = tet.grid # Get the pyvista.UnstructuredGrid
+        # Check if tetgen actually produced cells
+        if grid.n_cells == 0:
+             print("Warning: tetgen did not produce any tetrahedra. Check input mesh quality and tetgen switches.")
+             # Fallback?
+             return None
+        return grid
+    except Exception as e:
+        print(f"Error during tetgen tetrahedralization: {e}")
+        print("Tetgen failed. Check input mesh manifoldness and self-intersections.")
+        return None
 
 def deform_mesh(tet_mesh,
                             angle_threshold=45,
