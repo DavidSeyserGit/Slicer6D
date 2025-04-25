@@ -73,6 +73,8 @@ class MeshDeformer:
         self._plotter = None
         self._gif_frame_count = 0
 
+
+    #these are parameter for the deformation step and all underlying steps that are part of it
     def _process_params(self, kwargs):
         """Extracts and converts parameters."""
         params = {
@@ -102,68 +104,6 @@ class MeshDeformer:
         if self.verbose:
             log.log(level, message)
 
-    def _initialize_gif(self, filename_suffix):
-        """Initializes the plotter for GIF saving."""
-        if not self.params['save_gifs']:
-            return False
-        try:
-            # Ensure XVFB is running if needed (might be handled externally)
-            # pv.start_xvfb()
-            self._plotter = pv.Plotter(off_screen=True)
-            gif_path = f"{self.params['model_name']}_{filename_suffix}.gif"
-            self._plotter.open_gif(gif_path)
-            self._log(f"Saving GIF to {gif_path}")
-            self._gif_frame_count = 0
-            return True
-        except Exception as e:
-            self._log(f"Could not initialize plotter for GIF: {e}", logging.WARNING)
-            self.params['save_gifs'] = False # Disable if setup fails
-            return False
-
-    def _save_gif_frame(self, frame_data, frame_type):
-        """Saves a single frame to the open GIF."""
-        if not self.params['save_gifs'] or self._plotter is None:
-            return
-
-        self._gif_frame_count += 1
-        # Optional: Skip frames to speed up saving
-        if frame_type == 'deformation' and self._gif_frame_count % 10 != 0:
-             return
-
-        self._plotter.clear_actors()
-        if frame_type == 'rotation':
-            rotation_field_rad = frame_data
-            # Create temporary mesh for visualization
-            unique_verts_rot = self._calculate_unique_vertices_rotated(self.undeformed_tet, rotation_field_rad)
-            num_cells = self.undeformed_tet.number_of_cells
-            unique_cells = np.hstack((np.full((num_cells, 1), 4, dtype=int),
-                                      np.arange(num_cells * 4).reshape(-1, 4)))
-            temp_tet = pv.UnstructuredGrid(unique_cells.flatten(),
-                                           np.full(num_cells, pv.CellType.TETRA),
-                                           unique_verts_rot.reshape(-1, 3))
-            temp_tet.cell_data["rotation (deg)"] = np.rad2deg(rotation_field_rad)
-            clim_deg = np.rad2deg([self.params['max_neg_rotation_rad'], self.params['max_pos_rotation_rad']])
-            clim_deg = [max(-90, clim_deg[0]), min(90, clim_deg[1])] # Sensible limits
-            self._plotter.add_mesh(temp_tet, scalars="rotation (deg)", clim=clim_deg, lighting=False, cmap="coolwarm")
-
-        elif frame_type == 'deformation':
-            current_vertices = frame_data
-            temp_tet = pv.UnstructuredGrid(self.undeformed_tet.cells, self.undeformed_tet.cell_type, current_vertices)
-            self._plotter.add_mesh(temp_tet, color='lightblue', opacity=0.8)
-
-        self._plotter.camera_position = 'iso'
-        self._plotter.write_frame()
-
-    def _close_gif(self):
-        """Closes the GIF file."""
-        if self._plotter:
-            try:
-                self._plotter.close()
-                self._log("GIF saving complete.")
-            except Exception as e:
-                self._log(f"Error closing GIF plotter: {e}", logging.WARNING)
-            self._plotter = None
-        
     # --- Core Calculation Steps as Methods ---
 
     def _tetrahedralize(self):
