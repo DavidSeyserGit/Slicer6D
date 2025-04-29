@@ -11,7 +11,24 @@ import pickle
 import base64
 import time
 import logging
+import sys
+import os
+from pathlib import Path
 
+# Add the find_neighbors directory to path
+current_dir = Path(__file__).parent
+sys.path.append(str(current_dir / "find_neighbors"))
+
+# Try to import the Cython module
+try:
+    import deformer_cython
+    CYTHON_AVAILABLE = True
+    import logging
+    logging.info("Cython optimization module loaded successfully!")
+except ImportError as e:
+    CYTHON_AVAILABLE = False
+    import logging
+    logging.warning(f"Cython optimization not available: {e}")
 
 # Implementation like in S4
 # https://github.com/jyjblrd/S4_Slicer
@@ -147,64 +164,157 @@ class MeshDeformer:
             self._log(f"Error centering mesh: {e}", logging.ERROR)
             return False
 
-
-    #we find neighboring cells to each cell
     def _find_neighbours(self):
         self._log("3. Finding cell neighbours...")
         try:
-            # Use numpy arrays for faster access
+            # Extract necessary data
+            cells = self.tet.field_data.get("cells", 
+                self.tet.cells.reshape(-1, 5)[:, 1:])
             n_cells = self.tet.number_of_cells
+            
+            # Initialize neighbor dict with the CORRECT STRUCTURE
             neighbor_types = ["point", "edge", "face"]
+            self.neighbour_dict = {}
             
-            # Pre-allocate lists with estimated capacity
-            self.neighbour_dict = {nt: [[] for _ in range(n_cells)] for nt in neighbor_types}
-            
-            # Process by neighbor type (more cache-friendly)
+            # IMPORTANT: Create as dict of lists, not list of lists
             for ntype in neighbor_types:
-                for cell_idx in range(n_cells):
-                    neighbours = self.tet.cell_neighbors(cell_idx, f"{ntype}s")
-                    self.neighbour_dict[ntype][cell_idx] = [n for n in neighbours if n != -1 and n < n_cells]
+                self.neighbour_dict[ntype] = {}
+            
+            # Try to import Cython dynamically (to handle import errors better)
+            cython_module = None
+            try:
+                # Add multiple possible import paths
+                import sys
+                from pathlib import Path
+                current_dir = Path(__file__).parent
+                sys.path.append(str(current_dir))
+                sys.path.append(str(current_dir / "find_neighbors"))
+                sys.path.append(str(current_dir / "find_neighbors" / "build" / "lib.macosx-15.2-arm64-cpython-310"))
+                
+                # Try multiple import strategies
+                try:
+                    import deformer_cython
+                    cython_module = deformer_cython
+                    self._log("   Successfully imported deformer_cython module")
+                except ImportError:
+                    try:
+                        from find_neighbors import deformer_cython
+                        cython_module = deformer_cython
+                        self._log("   Successfully imported from find_neighbors package")
+                    except ImportError:
+                        self._log("   Cython module not found in standard locations")
+            except Exception as e:
+                self._log(f"   Import error: {e}", logging.WARNING)
+            
+            # Use Cython if available
+            if cython_module is not None:
+                self._log("   Using Cython-optimized neighbor calculation")
+                try:
+                    # Convert to int32
+                    cells_int32 = np.array(cells, dtype=np.int32)
+                    self._log(f"   Cell data type converted from {cells.dtype} to {cells_int32.dtype}")
                     
+                    # Call the function with the correct name
+                    if hasattr(cython_module, 'find_neighbors_cython'):
+                        neighbor_result = cython_module.find_neighbors_cython(cells_int32, n_cells)
+                        
+                        # Convert result to correct dictionary format
+                        for ntype in neighbor_types:
+                            for i in range(n_cells):
+                                self.neighbour_dict[ntype][i] = neighbor_result[ntype][i]
+                        
+                        self._log("   Cython neighbor calculation completed")
+                    else:
+                        available_funcs = [f for f in dir(cython_module) if not f.startswith('_')]
+                        self._log(f"   Function 'find_neighbors_cython' not found in module. Available: {available_funcs}")
+                        raise AttributeError("Function not found in module")
+                        
+                except Exception as e:
+                    self._log(f"   Cython neighbor calculation failed: {e}", logging.WARNING)
+                    # Fall through to Python implementation
+            
+            # Original Python implementation (always run if Cython failed or not available)
+            if cython_module is None or any(len(self.neighbour_dict[nt]) == 0 for nt in neighbor_types):
+                self._log("   Using Python neighbor calculation")
+                
+                for ntype in neighbor_types:
+                    self.neighbour_dict[ntype] = {}
+                    for cell_idx in range(n_cells):
+                        neighbours = self.tet.cell_neighbors(cell_idx, f"{ntype}s")
+                        self.neighbour_dict[ntype][cell_idx] = [n for n in neighbours if n != -1 and n < n_cells]
+            
+            # Verify neighbor dict has correct structure before returning
+            for ntype in neighbor_types:
+                if not isinstance(self.neighbour_dict.get(ntype, {}), dict):
+                    self._log(f"   WARNING: neighbour_dict[{ntype}] is not a dictionary! Fixing...", logging.WARNING)
+                    self.neighbour_dict[ntype] = {i: [] for i in range(n_cells)}
+            
             self._log("   Neighbours identified.")
             return True
         except Exception as e:
             self._log(f"Error finding neighbours: {e}", logging.ERROR)
             return False
 
-        
     def _calculate_attributes(self):
         self._log("4. Calculating initial tetrahedral attributes...")
         try:
-            # Calculate base attributes (face mapping, initial bottom)
-            self.tet, _, self.bottom_cells = self._calculate_tet_attributes_internal(self.tet)
+            # Extract data needed for calculation
+            points = self.tet.points  # Keep as float64
+            cells = self.tet.field_data.get("cells", 
+                self.tet.cells.reshape(-1, 5)[:, 1:])
+            
+            # Extract faces from surface mesh
+            surface_mesh = self.tet.extract_surface()
+            faces = surface_mesh.faces.reshape(-1, 4)[:, 1:]
+            
+            # Ensure cells and faces are int32
+            cells_int32 = np.array(cells, dtype=np.int32)
+            faces_int32 = np.array(faces, dtype=np.int32)
+            
+            # Debug info
+            self._log(f"   Points dtype: {points.dtype}, shape: {points.shape}")
+            self._log(f"   Cells dtype: {cells_int32.dtype}, shape: {cells_int32.shape}")
+            self._log(f"   Faces dtype: {faces_int32.dtype}, shape: {faces_int32.shape}")
+            
+            # Call Cython function with original points (float64)
+            self._log("   Using Cython-optimized attribute calculation")
+            attr_result = deformer_cython.calculate_attributes_cython(
+                points, cells_int32, faces_int32, self.neighbour_dict)
+            
+            # Extract results
+            self.tet.add_field_data(encode_object(attr_result["cell_to_face"]), "cell_to_face")
+            
+            # Ensure bottom_cells are integers
+            self.bottom_cells = [int(cell) for cell in attr_result["bottom_cells"]]
             self._log(f"   Found {len(self.bottom_cells)} initial bottom cells.")
-
-            # Build connectivity graph (using 'point' neighbours for consistency)
-            self._log("   Building cell neighbour graph...")
-            self.cell_neighbour_graph = nx.Graph()
-            cell_centers = self.tet.cell_centers().points
-            processed_pairs = set()
-            for cell_idx, neighbours in self.neighbour_dict["point"].items():
-                for neighbour_idx in neighbours:
-                    pair = tuple(sorted((cell_idx, neighbour_idx)))
-                    if pair not in processed_pairs:
-                        distance = np.linalg.norm(cell_centers[cell_idx] - cell_centers[neighbour_idx])
-                        self.cell_neighbour_graph.add_edge(cell_idx, neighbour_idx, weight=distance)
-                        processed_pairs.add(pair)
-            self._log("   Cell neighbour graph built.")
-
-            # Calculate derived attributes (normals, angles, 'in_air')
-            self._log("   Updating full tet attributes (normals, centers, angles)...")
+            
+            # Add cell centers to mesh
+            self.tet.cell_data["cell_center"] = attr_result["cell_centers"]
+            
+            # Create sparse matrix from dense
+            import scipy.sparse as sp
+            adjacency = attr_result["adjacency_matrix"]
+            self.cell_adjacency_matrix = sp.csr_matrix(adjacency)
+            
+            # Create graph from adjacency matrix
+            import networkx as nx
+            self.cell_neighbour_graph = nx.from_scipy_sparse_array(
+                self.cell_adjacency_matrix, edge_attribute='weight')
+            
+            # Continue with attribute updates for both meshes
+            self._log("   Updating attributes for both meshes...")
             self.tet = self._update_tet_attributes_internal(self.tet, self.cell_neighbour_graph, self.bottom_cells)
-
-            # Update the undeformed copy too
             self.undeformed_tet, _, _ = self._calculate_tet_attributes_internal(self.undeformed_tet)
-            self.undeformed_tet = self._update_tet_attributes_internal(self.undeformed_tet, self.cell_neighbour_graph, self.bottom_cells)
+            self.undeformed_tet = self._update_tet_attributes_internal(
+                self.undeformed_tet, self.cell_neighbour_graph, self.bottom_cells)
+                
             self._log("   Full attributes calculated.")
             return True
-
+            
         except Exception as e:
             self._log(f"Error calculating tet attributes: {e}", logging.ERROR)
+            import traceback
+            self._log(traceback.format_exc(), logging.ERROR)
             return False
 
     def _optimize_rotations(self):
@@ -212,59 +322,215 @@ class MeshDeformer:
         start_time = time.time()
 
         try:
+            # --- Safety check and fix for neighbour_dict structure ---
+            for ntype in ["point", "edge", "face"]:
+                if not isinstance(self.neighbour_dict.get(ntype), dict):
+                    self._log(f"   WARNING: Fixing neighbour_dict[{ntype}] structure (was not dict)...", logging.WARNING)
+                    temp_dict = {}
+                    # Attempt conversion assuming it might be list-like
+                    try:
+                        for i, neighbors in enumerate(self.neighbour_dict.get(ntype, [])):
+                            temp_dict[i] = neighbors
+                    except TypeError: # Handle cases where it's not iterable
+                        self._log(f"   ERROR: neighbour_dict[{ntype}] is not iterable, cannot fix automatically.", logging.ERROR)
+                        temp_dict = {i: [] for i in range(self.undeformed_tet.number_of_cells)} # Fallback
+                    self.neighbour_dict[ntype] = temp_dict
+            # --- End safety check ---
+
             # --- Calculate Initial Target Rotation ---
             initial_rotation_field = self._calculate_initial_rotation_field()
             initial_rotation_target = np.nan_to_num(initial_rotation_field, nan=0.0)
 
-            # --- Setup Optimization ---
-            cell_face_neighbours = []
+            # --- Setup Optimization: Build cell_face_neighbours carefully ---
+            cell_face_neighbours_list = [] # Use a list first
             processed_pairs = set()
-            for cell_idx, neighbours in self.neighbour_dict["face"].items():
-                for neighbour_idx in neighbours:
-                    pair = tuple(sorted((cell_idx, neighbour_idx)))
+            face_dict = self.neighbour_dict.get("face", {}) # Use .get for safety
+
+            self._log(f"   Building cell_face_neighbours from face_dict (size: {len(face_dict)})...")
+            conversion_errors = 0
+            for cell_idx, neighbours in face_dict.items():
+                try:
+                    cell_idx_int = int(cell_idx) # Convert key
+                except (ValueError, TypeError):
+                    self._log(f"   ERROR: Skipping invalid cell index key: {cell_idx} (type: {type(cell_idx)})", logging.ERROR)
+                    conversion_errors += 1
+                    continue
+
+                if not isinstance(neighbours, (list, tuple, np.ndarray)):
+                    self._log(f"   WARNING: Skipping invalid neighbours value for cell {cell_idx_int} (type: {type(neighbours)})", logging.WARNING)
+                    continue
+
+                for neighbour_val in neighbours:
+                    try:
+                        neighbour_idx_int = int(neighbour_val) # Convert value
+                    except (ValueError, TypeError):
+                        self._log(f"   ERROR: Skipping invalid neighbour index value for cell {cell_idx_int}: {neighbour_val} (type: {type(neighbour_val)})", logging.ERROR)
+                        conversion_errors += 1
+                        continue
+
+                    # Check bounds immediately after conversion
+                    if cell_idx_int < 0 or neighbour_idx_int < 0:
+                        self._log(f"   ERROR: Skipping negative index pair: ({cell_idx_int}, {neighbour_idx_int})", logging.ERROR)
+                        conversion_errors += 1
+                        continue
+
+                    pair = tuple(sorted((cell_idx_int, neighbour_idx_int)))
                     if pair not in processed_pairs:
-                        cell_face_neighbours.append(list(pair))
+                        cell_face_neighbours_list.append(list(pair))
                         processed_pairs.add(pair)
-            cell_face_neighbours = np.array(cell_face_neighbours, dtype=int)
-            num_neighbour_pairs = len(cell_face_neighbours)
+
+            if conversion_errors > 0:
+                self._log(f"   {conversion_errors} errors occurred during neighbour index conversion.", logging.WARNING)
+
+            # Convert list to numpy array *only if* it's not empty
+            if not cell_face_neighbours_list:
+                self._log("   WARNING: No valid cell face neighbour pairs found after conversion. Rotation optimization might be trivial.", logging.WARNING)
+                cell_face_neighbours = np.empty((0, 2), dtype=np.int32) # Handle empty case
+            else:
+                # Perform final check for non-integer types before creating array
+                all_ints = all(isinstance(p[0], int) and isinstance(p[1], int) for p in cell_face_neighbours_list)
+                if not all_ints:
+                    self._log("   ERROR: Non-integer values detected in cell_face_neighbours_list before final conversion!", logging.ERROR)
+                    # Find and log problematic entries
+                    for i, p in enumerate(cell_face_neighbours_list):
+                        if not (isinstance(p[0], int) and isinstance(p[1], int)):
+                            self._log(f"      Problematic pair at index {i}: {p} (types: {type(p[0])}, {type(p[1])})")
+                    # Decide how to proceed: maybe filter them out or raise error
+                    # Filtering approach:
+                    cell_face_neighbours_list = [p for p in cell_face_neighbours_list if isinstance(p[0], int) and isinstance(p[1], int)]
+                    if not cell_face_neighbours_list:
+                        cell_face_neighbours = np.empty((0, 2), dtype=np.int32)
+                    else:
+                        cell_face_neighbours = np.array(cell_face_neighbours_list, dtype=np.int32)
+                else:
+                    cell_face_neighbours = np.array(cell_face_neighbours_list, dtype=np.int32)
+            # --- End Setup Optimization ---
+
+
+            num_neighbour_pairs = cell_face_neighbours.shape[0]
             num_cells = self.undeformed_tet.number_of_cells
             num_residuals = num_neighbour_pairs + num_cells
 
+            # --- DETAILED DEBUG LOGGING (Post Conversion) ---
+            self._log(f"   num_cells: {num_cells}")
+            self._log(f"   num_neighbour_pairs: {num_neighbour_pairs}")
+            self._log(f"   num_residuals: {num_residuals}")
+            self._log(f"   Final cell_face_neighbours shape: {cell_face_neighbours.shape}, dtype: {cell_face_neighbours.dtype}")
+
+            if num_neighbour_pairs > 0:
+                self._log(f"   Sample cell_face_neighbours[0]: {cell_face_neighbours[0]}, type: {type(cell_face_neighbours[0,0])}")
+                # Check bounds against num_cells
+                max_idx_0 = np.max(cell_face_neighbours[:, 0])
+                max_idx_1 = np.max(cell_face_neighbours[:, 1])
+                min_idx_0 = np.min(cell_face_neighbours[:, 0])
+                min_idx_1 = np.min(cell_face_neighbours[:, 1])
+                self._log(f"   Index range in cell_face_neighbours[:, 0]: [{min_idx_0}, {max_idx_0}]")
+                self._log(f"   Index range in cell_face_neighbours[:, 1]: [{min_idx_1}, {max_idx_1}]")
+
+                if max_idx_0 >= num_cells or max_idx_1 >= num_cells or min_idx_0 < 0 or min_idx_1 < 0:
+                    self._log(f"   CRITICAL ERROR: Index in cell_face_neighbours is out of bounds [0, {num_cells-1}]!", logging.ERROR)
+                    # Find and log specific problematic indices
+                    bad_indices = cell_face_neighbours[(cell_face_neighbours[:, 0] >= num_cells) |
+                                                    (cell_face_neighbours[:, 1] >= num_cells) |
+                                                    (cell_face_neighbours[:, 0] < 0) |
+                                                    (cell_face_neighbours[:, 1] < 0)]
+                    self._log(f"   Problematic pairs: {bad_indices}")
+                    # Stop execution as this will definitely fail
+                    raise IndexError(f"Invalid indices found in cell_face_neighbours. Max index allowed: {num_cells-1}")
+            else:
+                self._log("   No neighbour pairs to check bounds for.")
+
+            self._log(f"   initial_rotation_target shape: {initial_rotation_target.shape}, dtype: {initial_rotation_target.dtype}")
+            if len(initial_rotation_target) != num_cells:
+                self._log(f"   ERROR: initial_rotation_target length ({len(initial_rotation_target)}) does not match num_cells ({num_cells})!", logging.ERROR)
+                # Adjust or raise error
+                initial_rotation_target = np.resize(initial_rotation_target, num_cells) # Example fix: resize
+                self._log(f"   Resized initial_rotation_target to shape: {initial_rotation_target.shape}")
+            # --- END DETAILED DEBUG LOGGING ---
+
+
             # --- Nested Objective/Jacobian/Sparsity ---
             def objective(current_rotation_field_rad):
+                # Ensure input is usable
+                if len(current_rotation_field_rad) != num_cells:
+                    self._log(f"   ERROR in objective: Input length {len(current_rotation_field_rad)} != num_cells {num_cells}", logging.ERROR)
+                    # Return something sensible or raise error
+                    return np.zeros(num_residuals) # Example fallback
+
                 if num_neighbour_pairs > 0:
-                    diffs = current_rotation_field_rad[cell_face_neighbours[:, 0]] - current_rotation_field_rad[cell_face_neighbours[:, 1]]
+                    # Use the already validated integer array directly
+                    idx0 = cell_face_neighbours[:, 0]
+                    idx1 = cell_face_neighbours[:, 1]
+                    # No need for astype(np.int32) if cell_face_neighbours is already int32
+                    diffs = current_rotation_field_rad[idx0] - current_rotation_field_rad[idx1]
                     neighbour_residuals = np.sqrt(self.params['neighbour_loss_weight']) * diffs
                 else:
-                    neighbour_residuals = np.array([])
+                    neighbour_residuals = np.array([], dtype=np.float64)
+
                 initial_residuals = current_rotation_field_rad - initial_rotation_target
+                # Check shapes before concatenation
+                if len(neighbour_residuals) != num_neighbour_pairs or len(initial_residuals) != num_cells:
+                    self._log(f"   ERROR in objective concatenation: Shapes mismatch! neighbour_res={len(neighbour_residuals)} (expected {num_neighbour_pairs}), initial_res={len(initial_residuals)} (expected {num_cells})", logging.ERROR)
+                    return np.zeros(num_residuals) # Fallback
+
                 return np.concatenate((neighbour_residuals, initial_residuals))
 
             def jacobian(current_rotation_field_rad):
-                jac = lil_matrix((num_residuals, num_cells), dtype=np.float32)
+                # Ensure input is usable
+                if len(current_rotation_field_rad) != num_cells:
+                    self._log(f"   ERROR in jacobian: Input length {len(current_rotation_field_rad)} != num_cells {num_cells}", logging.ERROR)
+                    return csr_matrix((num_residuals, num_cells), dtype=np.float64) # Return empty sparse
+
+                jac = lil_matrix((num_residuals, num_cells), dtype=np.float64)
                 sqrt_weight = np.sqrt(self.params['neighbour_loss_weight'])
                 if num_neighbour_pairs > 0:
-                    rows = np.arange(num_neighbour_pairs)
-                    jac[rows, cell_face_neighbours[:, 0]] = sqrt_weight
-                    jac[rows, cell_face_neighbours[:, 1]] = -sqrt_weight
-                rows_initial = np.arange(num_neighbour_pairs, num_residuals)
-                cols_initial = np.arange(num_cells)
+                    rows = np.arange(num_neighbour_pairs, dtype=np.int32)
+                    # Use the already validated integer array directly
+                    cols0 = cell_face_neighbours[:, 0]
+                    cols1 = cell_face_neighbours[:, 1]
+                    jac[rows, cols0] = sqrt_weight
+                    jac[rows, cols1] = -sqrt_weight
+
+                rows_initial = np.arange(num_neighbour_pairs, num_residuals, dtype=np.int32)
+                cols_initial = np.arange(num_cells, dtype=np.int32)
                 jac[rows_initial, cols_initial] = 1.0
                 return jac.tocsr()
 
             def sparsity():
                 s = lil_matrix((num_residuals, num_cells), dtype=np.int8)
                 if num_neighbour_pairs > 0:
-                    rows = np.arange(num_neighbour_pairs)
-                    s[rows, cell_face_neighbours[:, 0]] = 1
-                    s[rows, cell_face_neighbours[:, 1]] = 1
-                rows_initial = np.arange(num_neighbour_pairs, num_residuals)
-                cols_initial = np.arange(num_cells)
+                    rows = np.arange(num_neighbour_pairs, dtype=np.int32)
+                    cols0 = cell_face_neighbours[:, 0]
+                    cols1 = cell_face_neighbours[:, 1]
+                    s[rows, cols0] = 1
+                    s[rows, cols1] = 1
+                rows_initial = np.arange(num_neighbour_pairs, num_residuals, dtype=np.int32)
+                cols_initial = np.arange(num_cells, dtype=np.int32)
                 s[rows_initial, cols_initial] = 1
                 return s.tocsr()
+            # --- End Nested Functions ---
 
             # --- Run Optimization ---
-            initial_guess = np.zeros(num_cells)
+            initial_guess = np.zeros(num_cells, dtype=np.float64)
+            self._log(f"   Running least_squares with initial_guess shape: {initial_guess.shape}, dtype: {initial_guess.dtype}")
+
+            # Final check before calling least_squares
+            if num_cells <= 0:
+                self._log("   ERROR: num_cells is zero or negative. Cannot run optimization.", logging.ERROR)
+                return False # Cannot proceed
+
+            # Check jacobian/sparsity shapes one last time
+            try:
+                jac_sparse = jacobian(initial_guess)
+                sparsity_pattern = sparsity()
+                expected_shape = (num_residuals, num_cells)
+                if jac_sparse.shape != expected_shape or sparsity_pattern.shape != expected_shape:
+                    self._log(f"   ERROR: Final Jacobian/Sparsity shape mismatch! Jac={jac_sparse.shape}, Sparsity={sparsity_pattern.shape}, Expected={expected_shape}", logging.ERROR)
+                    return False # Cannot proceed
+            except Exception as e:
+                self._log(f"   ERROR checking final Jacobian/Sparsity: {e}", logging.ERROR)
+                return False
+
             result = least_squares(
                 objective, initial_guess, jac=jacobian, jac_sparsity=sparsity(),
                 max_nfev=self.params['optimization_iterations'], verbose=0, # Use logger instead
@@ -273,8 +539,8 @@ class MeshDeformer:
             )
             self._log(f"   Optimization status: {result.status}, message: {result.message}")
             if not result.success:
-                 self._log("   Rotation optimization failed to converge.", logging.WARNING)
-                 # Decide whether to proceed with potentially bad rotations or fail
+                self._log("   Rotation optimization failed to converge.", logging.WARNING)
+                # Decide whether to proceed with potentially bad rotations or fail
 
             self.optimized_rotation_field_rad = np.clip(result.x,
                 self.params['max_neg_rotation_rad'], self.params['max_pos_rotation_rad'])
@@ -284,9 +550,26 @@ class MeshDeformer:
             self._log(f"   Rotation optimization finished in {time.time() - start_time:.2f} seconds.")
             return True
 
-        except Exception as e:
-            self._log(f"Error during rotation field optimization: {e}", logging.ERROR)
+        # Catch specific errors that might indicate indexing problems
+        except IndexError as e:
+            self._log(f"Caught IndexError during rotation optimization: {e}", logging.ERROR)
+            import traceback
+            self._log(traceback.format_exc(), logging.ERROR)
+            # Log relevant variables at the time of error
+            #self._log(f"   State at error: num_cells={num_cells}, num_neighbour_pairs={num_neighbour_pairs}")
+            #self._log(f"   cell_face_neighbours shape={cell_face_neighbours.shape if 'cell_face_neighbours' in locals() else 'Not defined'}")
             return False
+        except TypeError as e:
+            self._log(f"Caught TypeError during rotation optimization (often related to indexing): {e}", logging.ERROR)
+            import traceback
+            self._log(traceback.format_exc(), logging.ERROR)
+            return False
+        except Exception as e:
+            self._log(f"Unexpected error during rotation field optimization: {e}", logging.ERROR)
+            import traceback
+            self._log(traceback.format_exc(), logging.ERROR) # Log full traceback
+            return False
+
 
     def _calculate_deformation(self):
         self._log("6. Calculating mesh deformation...")
@@ -562,9 +845,9 @@ class MeshDeformer:
     def _calculate_path_length_gradient(self):
         """Internal: Calculate path length to base gradient."""
         num_cells = self.undeformed_tet.number_of_cells
-        gradient = np.zeros(num_cells)
-        distances = np.full(num_cells, np.nan)
-        closest_bottom_indices = np.full(num_cells, -1, dtype=int)
+        gradient = np.zeros(num_cells, dtype=np.float64) # Use float64 for gradient
+        distances = np.full(num_cells, np.nan, dtype=np.float64) # Use float64 for distances
+        closest_bottom_indices = np.full(num_cells, -1, dtype=np.int32) # Use int32
 
         if len(self.bottom_cells) == 0 or self.cell_neighbour_graph.number_of_nodes() == 0:
             self._log("Warning: No bottom cells/graph for path length gradient.", logging.WARNING)
@@ -573,76 +856,189 @@ class MeshDeformer:
             return gradient
 
         try:
-            dist_map, path_map = nx.multi_source_dijkstra(self.cell_neighbour_graph, set(self.bottom_cells))
-            overhang_angle = self.undeformed_tet.cell_data['overhang_angle']
+            # Ensure bottom_cells are integers for Dijkstra
+            valid_bottom_cells = {int(bc) for bc in self.bottom_cells if 0 <= int(bc) < num_cells}
+            if not valid_bottom_cells:
+                self._log("Warning: No valid bottom cells after filtering for path length gradient.", logging.WARNING)
+                # Assign NaN/zeros and return early
+                self.undeformed_tet.cell_data["cell_distance_to_bottom"] = distances
+                self.undeformed_tet.cell_data["path_length_to_base_gradient"] = gradient
+                return gradient
+
+            dist_map, path_map = nx.multi_source_dijkstra(self.cell_neighbour_graph, valid_bottom_cells)
+
+            # Ensure overhang_angle exists and handle potential NaNs
+            if 'overhang_angle' not in self.undeformed_tet.cell_data:
+                self._log("Warning: 'overhang_angle' not found in cell_data for path gradient calc.", logging.WARNING)
+                # Create a dummy array or handle appropriately
+                overhang_angle = np.full(num_cells, np.nan)
+            else:
+                overhang_angle = self.undeformed_tet.cell_data['overhang_angle']
+
             overhang_thresh = np.pi/2.0 + self.params['max_overhang_rad']
             is_overhang = ~np.isnan(overhang_angle) & (overhang_angle > overhang_thresh)
 
             for cell_idx in range(num_cells):
-                if is_overhang[cell_idx] and cell_idx not in self.bottom_cells and cell_idx in dist_map:
-                    closest_bottom_indices[cell_idx] = path_map[cell_idx][-1]
-                    distances[cell_idx] = dist_map[cell_idx]
+                # Ensure cell_idx is valid for dist_map access
+                if cell_idx in dist_map:
+                    distances[cell_idx] = dist_map[cell_idx] # Assign distance if reachable
+                    if is_overhang[cell_idx] and cell_idx not in valid_bottom_cells:
+                        # Ensure path exists and is not empty before accessing last element
+                        if cell_idx in path_map and path_map[cell_idx]:
+                            closest_bottom_indices[cell_idx] = int(path_map[cell_idx][-1]) # Ensure integer
+                        else:
+                            # Handle case where cell is overhang but has no path (should be rare)
+                            self._log(f"Warning: Overhang cell {cell_idx} has no path in Dijkstra result.", logging.WARNING)
+
         except Exception as e:
             self._log(f"Error during Dijkstra path calculation: {e}", logging.WARNING)
+            # Continue, but distances/closest_bottom might be incomplete
 
         self.undeformed_tet.cell_data["cell_distance_to_bottom"] = distances
+
+        # Ensure cell_center exists
+        if 'cell_center' not in self.undeformed_tet.cell_data:
+            self._log("Error: 'cell_center' not found in cell_data for path gradient calc.", logging.ERROR)
+            self.undeformed_tet.cell_data["path_length_to_base_gradient"] = gradient # Return zero gradient
+            return gradient
         cell_centers = self.undeformed_tet.cell_data["cell_center"]
 
-        # Calculate gradient using plane fitting or fallback
+        # --- Calculate gradient using plane fitting or fallback ---
+        edge_neighbours_dict = self.neighbour_dict.get("edge", {}) # Use .get for safety
+
         for cell_idx in range(num_cells):
-            if not np.isnan(distances[cell_idx]):
-                neighbours = self.neighbour_dict["edge"].get(cell_idx, [])
-                local_cells = np.unique(np.hstack((neighbours, cell_idx))) # Ensure unique indices
-                local_distances = distances[local_cells]
+            if not np.isnan(distances[cell_idx]): # Only process cells with a valid distance
+                # --- Validate Neighbours ---
+                raw_neighbours = edge_neighbours_dict.get(cell_idx, [])
+                valid_neighbours = []
+                if isinstance(raw_neighbours, (list, tuple, np.ndarray)):
+                    for n in raw_neighbours:
+                        try:
+                            n_int = int(n)
+                            # Check bounds immediately
+                            if 0 <= n_int < num_cells:
+                                valid_neighbours.append(n_int)
+                            else:
+                                self._log(f"   Skipping out-of-bounds edge neighbour {n_int} for cell {cell_idx}", logging.WARNING)
+                        except (ValueError, TypeError):
+                            self._log(f"   Skipping invalid edge neighbour value {n} (type: {type(n)}) for cell {cell_idx}", logging.WARNING)
+                else:
+                    self._log(f"   Invalid neighbour structure for cell {cell_idx}: type {type(raw_neighbours)}", logging.WARNING)
+                # --- End Validate Neighbours ---
+
+                # Combine valid neighbours and self, ensure unique, and cast to int32
+                combined_indices = np.array(valid_neighbours + [cell_idx], dtype=np.int32)
+                local_cells = np.unique(combined_indices)
+
+                # Check if local_cells is now valid before indexing
+                if local_cells.size == 0:
+                    self._log(f"   Warning: No valid local cells (neighbours + self) for cell {cell_idx} after filtering.", logging.WARNING)
+                    gradient[cell_idx] = 0 # Assign default gradient
+                    continue # Skip to next cell_idx
+
+                # --- THIS IS THE CRITICAL LINE ---
+                try:
+                    local_distances = distances[local_cells] # Use the validated integer array
+                except IndexError as ie:
+                    self._log(f"   CRITICAL INDEX ERROR at distances[local_cells] for cell_idx={cell_idx}", logging.ERROR)
+                    self._log(f"      distances shape: {distances.shape}, dtype: {distances.dtype}")
+                    self._log(f"      local_cells: {local_cells}, dtype: {local_cells.dtype}")
+                    self._log(f"      Min/Max local_cells: {np.min(local_cells)}, {np.max(local_cells)}")
+                    # Assign default gradient and continue to avoid crashing
+                    gradient[cell_idx] = 0
+                    continue # Skip to next cell_idx
+                except Exception as e:
+                    self._log(f"   Unexpected error indexing distances for cell_idx={cell_idx}: {e}", logging.ERROR)
+                    gradient[cell_idx] = 0
+                    continue # Skip to next cell_idx
+                # --- END CRITICAL LINE ---
+
                 valid_mask = ~np.isnan(local_distances)
-                local_cells = local_cells[valid_mask]
-                local_distances = local_distances[valid_mask]
+                local_cells_filtered = local_cells[valid_mask] # Filter based on valid distances
+                local_distances_filtered = local_distances[valid_mask]
+
+                # Ensure cell_idx is valid for cell_centers access
+                if not (0 <= cell_idx < cell_centers.shape[0]):
+                    self._log(f"   Error: cell_idx {cell_idx} out of bounds for cell_centers (shape {cell_centers.shape})", logging.ERROR)
+                    gradient[cell_idx] = 0
+                    continue
+
                 current_center_xy = cell_centers[cell_idx, :2]
                 norm_cc_xy = np.linalg.norm(current_center_xy)
 
-                if len(local_cells) < 3: # Fallback: Roll towards closest bottom
+                if len(local_cells_filtered) < 3: # Fallback: Roll towards closest bottom
                     closest_idx = closest_bottom_indices[cell_idx]
-                    grad_val = 0
-                    if closest_idx != -1:
+                    grad_val = 0.0 # Default to float
+                    # Ensure closest_idx is valid before using it
+                    if 0 <= closest_idx < cell_centers.shape[0]:
                         dir_to_bottom = cell_centers[closest_idx, :2] - current_center_xy
                         norm_dir = np.linalg.norm(dir_to_bottom)
                         if norm_dir > 1e-6 and norm_cc_xy > 1e-6:
                             dir_to_bottom /= norm_dir
                             center_dir = current_center_xy / norm_cc_xy
                             dot_prod = np.dot(center_dir, dir_to_bottom)
-                            grad_val = np.sign(dot_prod) if not np.isnan(dot_prod) else 0
+                            grad_val = np.sign(dot_prod) if not np.isnan(dot_prod) else 0.0
                     gradient[cell_idx] = grad_val
                 else: # Plane fitting
-                    points_fit = np.vstack((cell_centers[local_cells, :2].T, local_distances))
+                    # Ensure local_cells_filtered are valid indices for cell_centers
+                    if np.any(local_cells_filtered < 0) or np.any(local_cells_filtered >= cell_centers.shape[0]):
+                        self._log(f"   Error: Invalid indices in local_cells_filtered for plane fitting (cell {cell_idx})", logging.ERROR)
+                        gradient[cell_idx] = 0.0
+                        continue
+
+                    points_fit = np.vstack((cell_centers[local_cells_filtered, :2].T, local_distances_filtered))
                     try:
                         _, normal = planeFit(points_fit)
                         grad_xy = -normal[:2]
-                        grad_val = 0
+                        grad_val = 0.0
                         if norm_cc_xy > 1e-6:
                             center_dir = current_center_xy / norm_cc_xy
                             grad_val = np.dot(center_dir, grad_xy)
-                        gradient[cell_idx] = grad_val if not np.isnan(grad_val) else 0
-                    except Exception: gradient[cell_idx] = 0 # Plane fit failed
+                        gradient[cell_idx] = grad_val if not np.isnan(grad_val) else 0.0
+                    except Exception as pf_e:
+                        self._log(f"   Warning: Plane fit failed for cell {cell_idx}: {pf_e}", logging.WARNING)
+                        gradient[cell_idx] = 0.0 # Plane fit failed
 
         # Smoothing
         if self.params['initial_rotation_field_smoothing'] > 0:
             smoothed = gradient.copy()
-            mask_initial = (gradient != 0) & (~np.isnan(gradient))
+            mask_initial = (gradient != 0) & (~np.isnan(gradient)) # Use original gradient for mask
+            point_neighbours_dict = self.neighbour_dict.get("point", {}) # Use point neighbours for smoothing
+
             for _ in range(self.params['initial_rotation_field_smoothing']):
                 new_smoothed = smoothed.copy()
+                # Iterate only over cells that initially had a non-zero gradient
                 for cell_idx in np.where(mask_initial)[0]:
-                    neighbours = self.neighbour_dict["point"].get(cell_idx, [])
-                    local_cells = np.array(neighbours, dtype=int)
-                    valid_local_mask = mask_initial[local_cells] # Use initial mask
-                    local_cells = local_cells[valid_local_mask]
-                    if len(local_cells) > 0:
-                        new_smoothed[cell_idx] = np.mean(smoothed[local_cells]) # Average previous smooth step
-                smoothed = new_smoothed
-            gradient = smoothed
+                    # --- Validate Point Neighbours ---
+                    raw_point_neighbours = point_neighbours_dict.get(cell_idx, [])
+                    valid_point_neighbours = []
+                    if isinstance(raw_point_neighbours, (list, tuple, np.ndarray)):
+                        for n in raw_point_neighbours:
+                            try:
+                                n_int = int(n)
+                                if 0 <= n_int < num_cells: # Check bounds
+                                    valid_point_neighbours.append(n_int)
+                            except (ValueError, TypeError): pass # Ignore invalid neighbours silently during smoothing
+                    # --- End Validate Point Neighbours ---
 
+                    if valid_point_neighbours:
+                        # Use the *previous* smoothed values of valid neighbours
+                        neighbour_values = smoothed[valid_point_neighbours]
+                        # Filter out NaNs from neighbour values before averaging
+                        valid_neighbour_values = neighbour_values[~np.isnan(neighbour_values)]
+                        if valid_neighbour_values.size > 0:
+                            new_smoothed[cell_idx] = np.mean(valid_neighbour_values)
+                        # else: keep original smoothed value if all neighbours were NaN
+
+                smoothed = new_smoothed
+            gradient = smoothed # Assign smoothed result back
+
+        # Final assignment based on parameter
         if not self.params['set_initial_rotation_to_zero']:
+            # Keep NaNs where distance was NaN, otherwise use calculated/smoothed gradient
             gradient[np.isnan(distances)] = np.nan
         else:
+            # Convert all remaining NaNs (e.g., from smoothing isolated cells) to zero
             gradient = np.nan_to_num(gradient, nan=0.0)
 
         self.undeformed_tet.cell_data["path_length_to_base_gradient"] = gradient
