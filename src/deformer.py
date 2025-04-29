@@ -48,6 +48,7 @@ def planeFit(points):
     x = points - ctr[:, np.newaxis]
     M = np.dot(x, x.T)
     return ctr, svd(M)[0][:, -1]
+
 # --- Constants ---
 UP_VECTOR = np.array([0, 0, 1])
 # --- MeshDeformer Class ---
@@ -121,7 +122,7 @@ class MeshDeformer:
 
             #call tetgen and make the input mesh a volume (thetrahedra)
             input_tet_gen = tetgen.TetGen(self.input_mesh.points, faces_array)
-            # input_tet_gen.make_manifold() # Optional, can fail
+            input_tet_gen.make_manifold() # Optional, can fail
             input_tet_gen.tetrahedralize(order=1, mindihedral=10, minratio=1.5) # Add quality options
             self.tet = input_tet_gen.grid #assign self.tet to the newly created volume
             if self.tet is None or self.tet.number_of_cells == 0:
@@ -151,19 +152,26 @@ class MeshDeformer:
     def _find_neighbours(self):
         self._log("3. Finding cell neighbours...")
         try:
-            self.neighbour_dict = {nt: {i: [] for i in range(self.tet.number_of_cells)} for nt in ["point", "edge", "face"]}
-            for ntype in ["point", "edge", "face"]:
-                for cell_idx in range(self.tet.number_of_cells):
-                    # PyVista uses 'points', 'edges', 'faces'
+            # Use numpy arrays for faster access
+            n_cells = self.tet.number_of_cells
+            neighbor_types = ["point", "edge", "face"]
+            
+            # Pre-allocate lists with estimated capacity
+            self.neighbour_dict = {nt: [[] for _ in range(n_cells)] for nt in neighbor_types}
+            
+            # Process by neighbor type (more cache-friendly)
+            for ntype in neighbor_types:
+                for cell_idx in range(n_cells):
                     neighbours = self.tet.cell_neighbors(cell_idx, f"{ntype}s")
-                    valid_neighbours = [n for n in neighbours if n != -1 and n < self.tet.number_of_cells]
-                    self.neighbour_dict[ntype][cell_idx].extend(valid_neighbours)
+                    self.neighbour_dict[ntype][cell_idx] = [n for n in neighbours if n != -1 and n < n_cells]
+                    
             self._log("   Neighbours identified.")
             return True
         except Exception as e:
             self._log(f"Error finding neighbours: {e}", logging.ERROR)
             return False
 
+        
     def _calculate_attributes(self):
         self._log("4. Calculating initial tetrahedral attributes...")
         try:
