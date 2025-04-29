@@ -705,11 +705,11 @@ class MeshDeformer:
         self.success = False # Reset success flag
 
         steps = [
-            self._tetrahedralize,
-            self._center_mesh,
-            self._find_neighbours,
-            self._calculate_attributes,
-            self._optimize_rotations,
+            self._tetrahedralize, # start by making a volume out of surface model
+            self._center_mesh, # force mesh to be at the bed
+            self._find_neighbours, # find the neighbors of each cell
+            self._calculate_attributes, # normals, graph ...
+            self._optimize_rotations, # 
             self._calculate_deformation,
             self._create_final_mesh
         ]
@@ -744,6 +744,7 @@ class MeshDeformer:
             return set() # Return empty set on failure
 
 # --- Main Function Wrapper ---
+# need because i dont wanna change the main function
 def deform_mesh(mesh: pv.PolyData, **kwargs):
     """
     Deforms the mesh to mitigate overhangs using the MeshDeformer class.
