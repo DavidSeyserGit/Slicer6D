@@ -1,7 +1,9 @@
-import pytest
 import numpy as np
 import pyvista as pv # Needed for mesh creation
 from deformer import normalize, planeFit, encode_object, decode_object
+
+import pickle
+import base64
 
 def test_normalize():
     v1 = np.array([1.0, 0.0, 0.0])
@@ -84,3 +86,47 @@ def test_planeFit():
 
     # Check that the Z component of the normal vector is approximately 0.0.
     assert np.isclose(normal_tilted[2], 0.0)
+
+
+# test_encoding.py
+def test_encode_decode():
+    """
+    Tests the encode_object and decode_object functions with various data types.
+    """
+
+    # Test Case 1: List
+    original_list = [1, "two", 3.0, False, [5, 6]]
+    encoded_str = encode_object(original_list)
+    decoded_obj = decode_object(encoded_str)
+    assert decoded_obj == original_list
+
+    # Test Case 2: Dictionary (relevant to cell_to_face)
+    original_dict = {
+        "cell_0": [1, 5, 10],
+        "cell_1": [2],
+        "cell_10": [100, 101, 102, 103],
+        "metadata": {"version": 1.0, "name": "example"}
+    }
+    encoded_str = encode_object(original_dict)
+    decoded_obj = decode_object(encoded_str)
+    assert decoded_obj == original_dict
+
+    # Test Case 3: NumPy Array
+    original_numpy_array = np.array([[1.0, 2.5], [3.3, 4.8]])
+    encoded_str = encode_object(original_numpy_array)
+    decoded_obj = decode_object(encoded_str)
+    # Use np.array_equal for exact array comparison
+    assert np.array_equal(decoded_obj, original_numpy_array)
+
+    # Test Case 4: Empty List
+    original_empty_list = []
+    encoded_str = encode_object(original_empty_list)
+    decoded_obj = decode_object(encoded_str)
+    assert decoded_obj == original_empty_list
+
+    # Test Case 5: Empty Dictionary
+    original_empty_dict = {}
+
+    encoded_str = encode_object(original_empty_dict)
+    decoded_obj = decode_object(encoded_str)
+    assert decoded_obj == original_empty_dict
