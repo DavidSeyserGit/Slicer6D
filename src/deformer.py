@@ -51,6 +51,7 @@ def planeFit(points):
 # --- Constants ---
 UP_VECTOR = np.array([0, 0, 1])
 # --- MeshDeformer Class ---
+
 class MeshDeformer:
     """Encapsulates the tetrahedral mesh deformation process."""
     def __init__(self, mesh: pv.PolyData, **kwargs):
@@ -71,7 +72,6 @@ class MeshDeformer:
 
         # GIF saving state
         self._plotter = None
-        self._gif_frame_count = 0
 
 
     #these are parameter for the deformation step and all underlying steps that are part of it
@@ -106,20 +106,24 @@ class MeshDeformer:
 
     # --- Core Calculation Steps as Methods ---
 
+
+    #first step we make the input mesh into a volume (we might need to make it watertight)
     def _tetrahedralize(self):
         self._log("1. Tetrahedralizing...")
         try:
             # Ensure input mesh has faces defined correctly
             if isinstance(self.input_mesh.faces, np.ndarray) and self.input_mesh.faces.ndim == 1:
+                 #get faces from the input mesh
                  faces_array = self.input_mesh.faces.reshape(-1, 4)[:, 1:]
             else:
                  # Attempt to handle list or other formats if necessary, or raise error
                  raise ValueError("Input mesh faces format not recognized or incompatible.")
 
+            #call tetgen and make the input mesh a volume (thetrahedra)
             input_tet_gen = tetgen.TetGen(self.input_mesh.points, faces_array)
             # input_tet_gen.make_manifold() # Optional, can fail
             input_tet_gen.tetrahedralize(order=1, mindihedral=10, minratio=1.5) # Add quality options
-            self.tet = input_tet_gen.grid
+            self.tet = input_tet_gen.grid #assign self.tet to the newly created volume
             if self.tet is None or self.tet.number_of_cells == 0:
                 raise ValueError("Tetrahedralization resulted in 0 cells or failure.")
             self._log(f"   Created {self.tet.number_of_cells} tetrahedra.")
@@ -142,6 +146,8 @@ class MeshDeformer:
             self._log(f"Error centering mesh: {e}", logging.ERROR)
             return False
 
+
+    #we find neighboring cells to each cell
     def _find_neighbours(self):
         self._log("3. Finding cell neighbours...")
         try:
@@ -195,7 +201,6 @@ class MeshDeformer:
 
     def _optimize_rotations(self):
         self._log("5. Optimizing rotation field...")
-        gif_initialized = self._initialize_gif("optimize_rotations")
         start_time = time.time()
 
         try:
@@ -219,7 +224,6 @@ class MeshDeformer:
 
             # --- Nested Objective/Jacobian/Sparsity ---
             def objective(current_rotation_field_rad):
-                self._save_gif_frame(current_rotation_field_rad, 'rotation')
                 if num_neighbour_pairs > 0:
                     diffs = current_rotation_field_rad[cell_face_neighbours[:, 0]] - current_rotation_field_rad[cell_face_neighbours[:, 1]]
                     neighbour_residuals = np.sqrt(self.params['neighbour_loss_weight']) * diffs
@@ -275,8 +279,6 @@ class MeshDeformer:
         except Exception as e:
             self._log(f"Error during rotation field optimization: {e}", logging.ERROR)
             return False
-        finally:
-            if gif_initialized: self._close_gif()
 
     def _calculate_deformation(self):
         self._log("6. Calculating mesh deformation...")
@@ -284,7 +286,6 @@ class MeshDeformer:
             self._log("   Skipping deformation: Optimized rotation field not available.", logging.WARNING)
             return False
 
-        gif_initialized = self._initialize_gif("deformation")
         start_time = time.time()
 
         try:
@@ -305,7 +306,6 @@ class MeshDeformer:
             # --- Nested Objective/Jacobian/Sparsity ---
             def objective(current_params):
                 current_vertices = current_params.reshape(num_points, 3)
-                self._save_gif_frame(current_vertices, 'deformation')
                 current_cell_vertices = current_vertices[cells]
                 current_cell_centers = np.mean(current_cell_vertices, axis=1)
                 centered_current_vertices = current_cell_vertices - current_cell_centers[:, None, :]
@@ -385,8 +385,6 @@ class MeshDeformer:
         except Exception as e:
             self._log(f"Error during deformation calculation: {e}", logging.ERROR)
             return False
-        finally:
-            if gif_initialized: self._close_gif()
 
     def _create_final_mesh(self):
         self._log("7. Finalizing deformed mesh...")
@@ -699,18 +697,6 @@ class MeshDeformer:
                 self._log(f"Error creating rotation matrices: {e}", logging.WARNING)
         return matrices
 
-    def _calculate_unique_vertices_rotated(self, tet_mesh, rotation_field_rad):
-        """Internal: Calculate uniquely rotated vertices (for visualization)."""
-        matrices = self._calculate_rotation_matrices(tet_mesh, rotation_field_rad)
-        cells = tet_mesh.field_data["cells"]
-        vertices = tet_mesh.points
-        centers = tet_mesh.cell_data["cell_center"]
-        cell_coords = vertices[cells]
-        centered = cell_coords - centers[:, None, :]
-        rotated = np.einsum('cij,cjk->cik', matrices, centered.transpose(0, 2, 1)).transpose(0, 2, 1)
-        unique_verts = rotated + centers[:, None, :]
-        return unique_verts
-
     # --- Public Execution Method ---
     def run(self):
         """Executes the full deformation pipeline."""
@@ -732,7 +718,6 @@ class MeshDeformer:
             if not step_func(): # Execute step and check success
                 self._log(f"Pipeline stopped due to error in step: {step_func.__name__}", logging.ERROR)
                 # Clean up plotter if it was initialized
-                if self._plotter: self._close_gif()
                 return False # Stop pipeline
 
         self.success = True

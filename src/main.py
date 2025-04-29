@@ -119,7 +119,6 @@ class MainWindow(QMainWindow):
                               position="upper_left", name=ACTOR_STATUS_TEXT, color='white')
         self.status.showMessage("Ready. Load STL model to start.") # Initial status message
 
-    # --- Build Control Groups (Identical to previous version) ---
     def _build_file_group(self, parent_layout):
         gb = QGroupBox("File")
         l = QVBoxLayout(gb)
