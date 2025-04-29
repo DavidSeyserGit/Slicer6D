@@ -2,9 +2,6 @@ import numpy as np
 import pyvista as pv # Needed for mesh creation
 from deformer import normalize, planeFit, encode_object, decode_object
 
-import pickle
-import base64
-
 def test_normalize():
     v1 = np.array([1.0, 0.0, 0.0])
     assert np.allclose(normalize(v1), [1.0, 0.0, 0.0]) # Already normalized
