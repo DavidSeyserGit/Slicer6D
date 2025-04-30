@@ -15,9 +15,9 @@ import tempfile
 import traceback
 
 # Import our modules
-import deformer
-import slicing
-import gcode_optimizer
+from deformer import deformer
+from slicing import slicing
+from slicing import gcode_optimizer
 
 
 params = {
