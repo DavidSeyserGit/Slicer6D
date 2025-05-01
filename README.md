@@ -22,3 +22,12 @@ cd Slicer6D
 pip install -r requirements.txt
 python main.py
 ```
+
+--
+
+## References
+
+We used a similar approach in deforming the original Mesh and slicing afterwards as in:
+[S3 Slicer](https://github.com/zhangty019/S3_DeformFDM)
+[S4 Slicer](https://github.com/jyjblrd/S4_Slicer)
+

@@ -15,9 +15,25 @@ import tempfile
 import traceback
 
 # Import our modules
-import deformer
-import slicing
-import gcode_optimizer
+from deformer import deformer
+from slicing import slicing
+from slicing import gcode_optimizer
+
+
+params = {
+        "max_overhang_deg": 10.0,
+        "neighbour_loss_weight": 30.0,
+        "rotation_multiplier": 1.5,
+        "initial_rotation_field_smoothing": 20,
+        "set_initial_rotation_to_zero": False,
+        "steep_overhang_compensation": True,
+        "max_pos_rotation_deg": 45.0, # Limit max rotation more reasonably?
+        "max_neg_rotation_deg": -45.0,
+        "optimization_iterations": 10, # Fewer iterations for example
+        "deformation_iterations": 10, # Fewer iterations for example
+        "save_gifs": False, # Set to True to generate GIFs (can be slow)
+        "model_name": "pi_3mm_deformed_example"
+    }
 
 # Constants for actor names
 ACTOR_MAIN_MESH = "main_mesh"
@@ -33,7 +49,7 @@ ACTOR_LAYER_VIEW_MESH = "layer_view_mesh"
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("3D Print Overhang Deformer & Slicer")
+        self.setWindowTitle("Slicer6D")
         self.resize(1300, 900)
 
         # Model data
@@ -71,7 +87,6 @@ class MainWindow(QMainWindow):
         self._build_file_group(vctrl)
         self._build_view_group(vctrl)
         self._build_orientation_group(vctrl)
-        self._build_overhang_group(vctrl)
         self._build_deform_group(vctrl)
         self._build_slice_group(vctrl)
 
@@ -104,7 +119,6 @@ class MainWindow(QMainWindow):
                               position="upper_left", name=ACTOR_STATUS_TEXT, color='white')
         self.status.showMessage("Ready. Load STL model to start.") # Initial status message
 
-    # --- Build Control Groups (Identical to previous version) ---
     def _build_file_group(self, parent_layout):
         gb = QGroupBox("File")
         l = QVBoxLayout(gb)
@@ -175,28 +189,6 @@ class MainWindow(QMainWindow):
         self.bed_cb.setChecked(True)
         self.bed_cb.stateChanged.connect(self.update_display)
         layout.addWidget(self.bed_cb)
-        parent_layout.addWidget(gb)
-
-    def _build_overhang_group(self, parent_layout):
-        gb = QGroupBox("Overhang Detection")
-        l = QVBoxLayout(gb)
-        h1 = QHBoxLayout()
-        h1.addWidget(QLabel("Angle:"))
-        self.ang_sb = QSpinBox(); self.ang_sb.setRange(20, 90); self.ang_sb.setValue(45)
-        self.ang_sb.setSuffix("°"); h1.addWidget(self.ang_sb)
-        l.addLayout(h1)
-        h2 = QHBoxLayout()
-        h2.addWidget(QLabel("Support Dist:"))
-        self.sup_sb = QDoubleSpinBox(); self.sup_sb.setRange(0.1, 20.0)
-        self.sup_sb.setValue(5.0); self.sup_sb.setSuffix("mm")
-        self.sup_sb.setSingleStep(0.5); h2.addWidget(self.sup_sb)
-        l.addLayout(h2)
-        self.ray_cb = QCheckBox("Use Ray Trace (for Support Dist)")
-        self.ray_cb.setChecked(True)
-        l.addWidget(self.ray_cb)
-        btn_detect = QPushButton("Detect Overhangs")
-        btn_detect.clicked.connect(self.detect_overhangs)
-        l.addWidget(btn_detect)
         parent_layout.addWidget(gb)
 
     def _build_deform_group(self, parent_layout):
@@ -303,8 +295,6 @@ class MainWindow(QMainWindow):
 
     # --- load_model, apply_manual_rotation, set_orientation_preset, ---
     # --- detect_overhangs, deform_model, reset_model ---
-    # (These methods are identical to the previous version, ensuring they call
-    #  _reset_slice_data() appropriately when geometry/orientation changes)
     def load_model(self):
         fn, _ = QFileDialog.getOpenFileName(self, "Open STL", "", "STL Files (*.stl *.STL)")
         if not fn: return
@@ -335,6 +325,7 @@ class MainWindow(QMainWindow):
             self.overhang_faces = None; self.print_bed = None
             self._reset_slice_data()
             self.update_display(); return
+        
         self.original_mesh = self.base_mesh.copy()
         self.deformed_mesh  = None; self.overhang_faces = None
         self._reset_slice_data()
@@ -386,45 +377,16 @@ class MainWindow(QMainWindow):
         self.update_display()
         self.status.showMessage(f"Orientation set to: {preset}")
 
-    def detect_overhangs(self):
-        if self.original_mesh is None: self.status.showMessage("Load a model first."); return
-        if self.print_bed is None: self.status.showMessage("Print bed not determined."); return
-        mesh_to_check = self.original_mesh; current_print_bed = self.print_bed
-        angle = self.ang_sb.value(); support_dist = self.sup_sb.value(); use_ray = self.ray_cb.isChecked()
-        self.status.showMessage("Detecting overhangs..."); QApplication.processEvents()
-        try:
-            faces = deformer.detect_overhangs(mesh_to_check, angle_threshold=angle, print_bed=current_print_bed)
-            if use_ray and faces.size > 0:
-                self.status.showMessage(f"Detected {faces.size} candidates, filtering by ray trace..."); QApplication.processEvents()
-                centers = mesh_to_check.cell_centers().points; filtered_faces = []
-                ray_direction = -np.array(current_print_bed[0])
-                for f_idx in faces:
-                    if f_idx >= mesh_to_check.n_cells: continue
-                    center_point = centers[f_idx]; start_point = center_point + ray_direction * 1e-4
-                    hit_points, hit_indices = mesh_to_check.ray_trace(start_point, ray_direction, first_point=False)
-                    is_supported = False
-                    if len(hit_points) > 0:
-                        distances = np.linalg.norm(hit_points - center_point, axis=1); min_dist = np.min(distances)
-                        if min_dist <= support_dist: is_supported = True
-                    if not is_supported: filtered_faces.append(f_idx)
-                faces = np.array(filtered_faces, dtype=int)
-            self.overhang_faces = faces; self.update_display()
-            if faces.size > 0: self.status.showMessage(f"Detected {faces.size} unsupported overhang faces.")
-            else: self.status.showMessage("No unsupported overhangs detected.")
-        except Exception as e:
-            self.status.showMessage(f"Overhang detection error: {e}"); traceback.print_exc()
-            self.overhang_faces = None; self.update_display()
-
     def deform_model(self):
         if self.original_mesh is None: self.status.showMessage("Load a model first."); return
         if self.print_bed is None: self.status.showMessage("Print bed not determined."); return
+
+        #loaded from the load_model
         mesh_to_deform = self.original_mesh; current_print_bed = self.print_bed
-        angle = self.ang_sb.value(); support = self.sup_sb.value(); use_ray = self.ray_cb.isChecked(); max_iter= 50
         self.status.showMessage("Deforming mesh..."); QApplication.processEvents()
         try:
             deformed_result, modified_vertices = deformer.deform_mesh(
-                mesh_to_deform, angle_threshold=angle, print_bed=current_print_bed,
-                support_distance=support, use_ray=use_ray, max_iterations=max_iter)
+                mesh_to_deform, **params)
             self.deformed_mesh = deformed_result; self.overhang_faces = None
             self._reset_slice_data()
             self.update_display()
