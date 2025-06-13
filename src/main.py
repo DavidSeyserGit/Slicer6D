@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import (
     QLabel, QSplitter, QStatusBar, QScrollArea, QSlider
 )
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QIcon, QPixmap, QPainter
 from pyvistaqt import QtInteractor # Handles mouse/touchpad interaction
 import tempfile
 import traceback
@@ -51,6 +52,17 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Slicer6D")
         self.resize(1300, 900)
+        
+        # Set window icon with absolute path
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        icon_path = os.path.join(base_dir, 'logo', 'git_icon_transparent.png')
+        if os.path.exists(icon_path):
+            # Create icon from pixmap for better macOS support
+            pixmap = QPixmap(icon_path)
+            if not pixmap.isNull():
+                icon = QIcon(pixmap)
+                self.setWindowIcon(icon)
+                QApplication.setWindowIcon(icon)
 
         # Model data
         self.original_mesh = None
@@ -99,11 +111,26 @@ class MainWindow(QMainWindow):
         viewer_frame = QFrame()
         viewer_layout = QVBoxLayout(viewer_frame)
         viewer_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Add logo to the top-right corner of the viewer
+        logo_container = QWidget()
+        logo_layout = QHBoxLayout(logo_container)
+        logo_layout.setContentsMargins(0, 0, 10, 0)  # Add some padding on the right
+        logo_layout.addStretch()  # Push logo to the right
+        
+        logo_label = QLabel()
+        if os.path.exists(icon_path):
+            pixmap = QPixmap(icon_path)
+            # Scale the logo to a reasonable size (e.g., 80x80 pixels)
+            scaled_pixmap = pixmap.scaled(80, 80, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            logo_label.setPixmap(scaled_pixmap)
+        
+        logo_label.setStyleSheet("background: transparent;")
+        logo_layout.addWidget(logo_label)
+        viewer_layout.addWidget(logo_container)
+        
         # --- QtInteractor Setup ---
-        # This widget provides the 3D view and handles mouse/touchpad input
-        # for rotation (LMB drag), zoom (Scroll/RMB drag/Pinch), and pan (MMB drag/Shift+LMB drag)
         self.plotter = QtInteractor(viewer_frame)
-        # --- End QtInteractor Setup ---
         viewer_layout.addWidget(self.plotter)
         viewer_frame.setLayout(viewer_layout)
         splitter.addWidget(viewer_frame)
