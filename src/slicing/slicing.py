@@ -162,60 +162,53 @@ def generate_infill(polygons, spacing, angle_degrees, bounds):
     if width <= 0 or height <= 0:
         return []
 
-    # Combine polygons for efficient clipping (optional, can clip per polygon too)
     layer_area = unary_union(polygons)
     if layer_area.is_empty:
         return []
 
-    # Inset the area slightly for clipping infill (prevents touching perimeter)
-    # Adjust INFILL_CLIP_OFFSET as needed, 0 for no offset
     try:
         clip_area = layer_area.buffer(INFILL_CLIP_OFFSET)
-        if clip_area.is_empty: return [] # Return if buffer eliminates area
-    except Exception: # Buffer might fail on complex shapes
-        clip_area = layer_area # Fallback to original area
+        if clip_area.is_empty: return []
+    except Exception:
+        clip_area = layer_area
 
-    # Calculate diagonal length to ensure lines cover area after rotation
     diagonal = math.sqrt(width**2 + height**2)
     center_x = min_x + width / 2
     center_y = min_y + height / 2
 
-    # Generate horizontal lines covering the extended bounds
-    num_lines = int(diagonal / spacing) + 2 # Add buffer lines
+    num_lines = int(diagonal / spacing) + 2
     lines = []
     start_y = center_y - (num_lines / 2.0) * spacing
     for i in range(num_lines):
         y = start_y + i * spacing
-        # Extend lines beyond bounds to ensure coverage after rotation
         line = LineString([(center_x - diagonal, y), (center_x + diagonal, y)])
         lines.append(line)
 
-    # Rotate lines if needed
-    if not math.isclose(angle_degrees % 180, 0): # Avoid rotation for 0/180 deg
+    if not math.isclose(angle_degrees % 180, 0):
         rotated_lines = [rotate(line, angle_degrees, origin=(center_x, center_y)) for line in lines]
     else:
         rotated_lines = lines
 
-    # Clip lines against the (potentially inset) layer area
     infill_paths = []
-    for line in rotated_lines:
-        try:
-            intersection = clip_area.intersection(line)
-            # Handle different intersection results
-            if intersection.is_empty:
-                continue
-            elif isinstance(intersection, LineString):
-                if intersection.length > 1e-6: # Check length threshold
-                    infill_paths.append(intersection)
-            elif isinstance(intersection, MultiLineString):
-                for part in intersection.geoms: # Use .geoms for MultiLineString
-                     if part.length > 1e-6:
-                         infill_paths.append(part)
-            # Ignore Points or other geometry types
-        except Exception as e:
-             # This can happen with complex intersections
-             # print(f"    Warning: Shapely intersection error during infill: {e}")
-             pass # Skip this line on error
+    if not rotated_lines:
+        return infill_paths
+
+    all_intersections = clip_area.intersection(MultiLineString(rotated_lines))
+    
+    if all_intersections.is_empty:
+        return infill_paths
+        
+    if isinstance(all_intersections, LineString):
+        if all_intersections.length > 1e-6:
+            infill_paths.append(all_intersections)
+    elif isinstance(all_intersections, MultiLineString):
+        for part in all_intersections.geoms:
+            if part.length > 1e-6:
+                infill_paths.append(part)
+    elif isinstance(all_intersections, GeometryCollection):
+        for part in all_intersections.geoms:
+            if isinstance(part, LineString) and part.length > 1e-6:
+                infill_paths.append(part)
 
     return infill_paths
 
@@ -358,108 +351,111 @@ def slice_mesh_at_orientation(mesh, layer_height, print_direction):
     return distances.tolist(), all_layer_polygons, rot_matrix
 
 
-def generate_gcode_6dof(distances, layer_polygons, rot_matrix,
-                       feedrate=1500,
-                       extrusion_per_mm=0.05,
-                       travel_feed=3000,
-                       infill_spacing=2.0,
-                       infill_angle=45.0):
-    """
-    Generate 6DOF G-code with ABC orientation commands.
+# --- Caching for performance ---
+class BoundsCache:
+    """Simple cache for bounds calculation."""
+    def __init__(self):
+        self._cache = {}
+    
+    def get(self, key):
+        return self._cache.get(key)
+    
+    def set(self, key, value):
+        self._cache[key] = value
+    
+    def clear(self):
+        self._cache = {}
 
+_bounds_cache = BoundsCache()
+
+def get_bounds_cached(geometries, cache_key=None):
+    """Calculate bounds with optional caching."""
+    if cache_key is not None:
+        cached = _bounds_cache.get(cache_key)
+        if cached is not None:
+            return cached
+    
+    result = get_bounds(geometries)
+    
+    if cache_key is not None and result is not None:
+        _bounds_cache.set(cache_key, result)
+    
+    return result
+
+def generate_perimeter_gcode(polygons, z, dist, e_pos, feedrate, extrusion_per_mm, travel_feed, 
+                              orientation=None, visualization_paths=None):
+    """Generate G-code for perimeter (exterior and interior) of given polygons.
+    
     Args:
-        distances: list of distances along print direction (slicing positions)
-        layer_polygons: list of lists of shapely Polygons for each layer
-        rot_matrix: 3x3 rotation matrix used for slicing (transforms print direction to Z)
-        feedrate: printing feedrate in mm/min
-        extrusion_per_mm: extrusion amount per mm of XY travel
-        travel_feed: travel moves feedrate in mm/min
-        infill_spacing: spacing between infill lines (0 to disable)
-        infill_angle: angle of infill lines in degrees
-
+        polygons: List of shapely Polygon objects for the layer
+        z: Z height or distance
+        dist: Current distance value (for 6DOF)
+        e_pos: Current extrusion position
+        feedrate: Printing feedrate
+        extrusion_per_mm: Extrusion per mm
+        travel_feed: Travel feedrate
+        orientation: Optional tuple (a, b, c) for 6DOF orientation angles
+        visualization_paths: Optional list to append 3D paths for visualization
+    
     Returns:
-        String containing G-code with ABC orientation commands
+        Tuple (list of gcode lines, updated e_pos)
     """
-    e_pos = 0.0
     gcode_lines = []
+    current_e = e_pos
     
-    a, b, c = eulerAnglesFromRotationMatrix(rot_matrix)
-    
-    gcode_lines += [
-        "; 6DOF Slicer G-code",
-        "; Print direction transformed to Z-axis",
-        f"; Orientation: A={a:.2f} B={b:.2f} C={c:.2f}",
-        "G90 ; Absolute positioning",
-        "G21 ; Millimeters",
-        f"G1 F{travel_feed} ; Set travel feed",
-        f"G1 A{a:.2f} B{b:.2f} C{c:.2f} ; Set orientation",
-    ]
-    
-    for layer_idx, (dist, polygons) in enumerate(zip(distances, layer_polygons)):
-        if not polygons:
-            continue
+    for poly in polygons:
+        exterior_coords_2d = np.array(poly.exterior.coords)
+        if exterior_coords_2d.shape[0] >= 2:
+            if visualization_paths is not None:
+                z_col = np.full((exterior_coords_2d.shape[0], 1), z)
+                visualization_paths.append(np.hstack((exterior_coords_2d, z_col)))
+            
+            x0, y0 = exterior_coords_2d[0]
+            if orientation:
+                gcode_lines.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed} A{orientation[0]:.2f} B{orientation[1]:.2f} C{orientation[2]:.2f}")
+            else:
+                gcode_lines.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed}")
+            
+            current_x, current_y = x0, y0
+            for i in range(1, exterior_coords_2d.shape[0]):
+                x2, y2 = exterior_coords_2d[i]
+                if not (math.isclose(current_x, x2) and math.isclose(current_y, y2)):
+                    d = math.hypot(x2 - current_x, y2 - current_y)
+                    if d > 1e-6:
+                        current_e += d * extrusion_per_mm
+                        if orientation:
+                            gcode_lines.append(f"G1 X{x2:.3f} Y{y2:.3f} Z{z:.3f} A{orientation[0]:.2f} B{orientation[1]:.2f} C{orientation[2]:.2f} E{current_e:.5f} F{feedrate}")
+                        else:
+                            gcode_lines.append(f"G1 X{x2:.3f} Y{y2:.3f} E{current_e:.5f} F{feedrate}")
+                        current_x, current_y = x2, y2
         
-        gcode_lines.append(f"; Layer {layer_idx + 1} at distance {dist:.3f}")
-        gcode_lines.append(f"G1 Z{dist:.3f} F{travel_feed}")
-        
-        gcode_lines.append("; Perimeters")
-        for poly in polygons:
-            exterior_coords_2d = np.array(poly.exterior.coords)
-            if exterior_coords_2d.shape[0] >= 2:
-                x0, y0 = exterior_coords_2d[0]
-                gcode_lines.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed} A{a:.2f} B{b:.2f} C{c:.2f}")
+        for interior in poly.interiors:
+            interior_coords_2d = np.array(interior.coords)
+            if interior_coords_2d.shape[0] >= 2:
+                if visualization_paths is not None:
+                    z_col = np.full((interior_coords_2d.shape[0], 1), z)
+                    visualization_paths.append(np.hstack((interior_coords_2d, z_col)))
+                
+                x0, y0 = interior_coords_2d[0]
+                if orientation:
+                    gcode_lines.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed} A{orientation[0]:.2f} B{orientation[1]:.2f} C{orientation[2]:.2f}")
+                else:
+                    gcode_lines.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed}")
+                
                 current_x, current_y = x0, y0
-                for i in range(1, exterior_coords_2d.shape[0]):
-                    x2, y2 = exterior_coords_2d[i]
+                for i in range(1, interior_coords_2d.shape[0]):
+                    x2, y2 = interior_coords_2d[i]
                     if not (math.isclose(current_x, x2) and math.isclose(current_y, y2)):
                         d = math.hypot(x2 - current_x, y2 - current_y)
                         if d > 1e-6:
-                            e_pos += d * extrusion_per_mm
-                            gcode_lines.append(f"G1 X{x2:.3f} Y{y2:.3f} Z{dist:.3f} A{a:.2f} B{b:.2f} C{c:.2f} E{e_pos:.5f} F{feedrate}")
-                        current_x, current_y = x2, y2
-            
-            for interior in poly.interiors:
-                interior_coords_2d = np.array(interior.coords)
-                if interior_coords_2d.shape[0] >= 2:
-                    x0, y0 = interior_coords_2d[0]
-                    gcode_lines.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed} A{a:.2f} B{b:.2f} C{c:.2f}")
-                    current_x, current_y = x0, y0
-                    for i in range(1, interior_coords_2d.shape[0]):
-                        x2, y2 = interior_coords_2d[i]
-                        if not (math.isclose(current_x, x2) and math.isclose(current_y, y2)):
-                            d = math.hypot(x2 - current_x, y2 - current_y)
-                            if d > 1e-6:
-                                e_pos += d * extrusion_per_mm
-                                gcode_lines.append(f"G1 X{x2:.3f} Y{y2:.3f} Z{dist:.3f} A{a:.2f} B{b:.2f} C{c:.2f} E{e_pos:.5f} F{feedrate}")
-                            current_x, current_y = x2, y2
-        
-        if infill_spacing > 0:
-            gcode_lines.append("; Infill")
-            layer_bounds = get_bounds(polygons)
-            infill_lines = generate_infill(polygons, infill_spacing, infill_angle, layer_bounds)
-            
-            for line_seg in infill_lines:
-                infill_coords_2d = np.array(line_seg.coords)
-                if infill_coords_2d.shape[0] >= 2:
-                    x0, y0 = infill_coords_2d[0]
-                    gcode_lines.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed} A{a:.2f} B{b:.2f} C{c:.2f}")
-                    current_x, current_y = x0, y0
-                    for i in range(1, infill_coords_2d.shape[0]):
-                        x2, y2 = infill_coords_2d[i]
-                        if not (math.isclose(current_x, x2) and math.isclose(current_y, y2)):
-                            d = math.hypot(x2 - current_x, y2 - current_y)
-                            if d > 1e-6:
-                                e_pos += d * extrusion_per_mm
-                                gcode_lines.append(f"G1 X{x2:.3f} Y{y2:.3f} Z{dist:.3f} A{a:.2f} B{b:.2f} C{c:.2f} E{e_pos:.5f} F{feedrate}")
+                            current_e += d * extrusion_per_mm
+                            if orientation:
+                                gcode_lines.append(f"G1 X{x2:.3f} Y{y2:.3f} Z{z:.3f} A{orientation[0]:.2f} B{orientation[1]:.2f} C{orientation[2]:.2f} E{current_e:.5f} F{feedrate}")
+                            else:
+                                gcode_lines.append(f"G1 X{x2:.3f} Y{y2:.3f} E{current_e:.5f} F{feedrate}")
                             current_x, current_y = x2, y2
     
-    gcode_lines += [
-        "G1 Z5 F5000 ; Lift",
-        "M84 ; Disable steppers",
-        "; End of 6DOF G-code",
-    ]
-    
-    return "\n".join(gcode_lines)
+    return gcode_lines, current_e
 
 def generate_gcode_with_infill(z_levels, layer_polygons,
                                feedrate=1500,
@@ -493,45 +489,10 @@ def generate_gcode_with_infill(z_levels, layer_polygons,
 
         # --- 1. Print Perimeters (Exterior and Interior Holes) ---
         gcode_lines.append("; Perimeters")
-        for poly in polygons:
-            # Exterior perimeter
-            exterior_coords_2d = np.array(poly.exterior.coords)
-            if exterior_coords_2d.shape[0] >= 2:
-                # --- Store path for visualization ---
-                z_col = np.full((exterior_coords_2d.shape[0], 1), z)
-                visualization_paths.append(np.hstack((exterior_coords_2d, z_col)))
-                # --- End Store path ---
-                x0, y0 = exterior_coords_2d[0]
-                gcode_lines.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed}") # Travel to start
-                current_x, current_y = x0, y0
-                for i in range(1, exterior_coords_2d.shape[0]):
-                    x2, y2 = exterior_coords_2d[i]
-                    if not (math.isclose(current_x, x2) and math.isclose(current_y, y2)):
-                        d = math.hypot(x2 - current_x, y2 - current_y)
-                        if d > 1e-6:
-                            e_pos += d * extrusion_per_mm
-                            gcode_lines.append(f"G1 X{x2:.3f} Y{y2:.3f} E{e_pos:.5f} F{feedrate}")
-                        current_x, current_y = x2, y2
-
-            # Interior holes (if any)
-            for interior in poly.interiors:
-                interior_coords_2d = np.array(interior.coords)
-                if interior_coords_2d.shape[0] >= 2:
-                    # --- Store path for visualization ---
-                    z_col = np.full((interior_coords_2d.shape[0], 1), z)
-                    visualization_paths.append(np.hstack((interior_coords_2d, z_col)))
-                    # --- End Store path ---
-                    x0, y0 = interior_coords_2d[0]
-                    gcode_lines.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed}") # Travel to hole start
-                    current_x, current_y = x0, y0
-                    for i in range(1, interior_coords_2d.shape[0]):
-                        x2, y2 = interior_coords_2d[i]
-                        if not (math.isclose(current_x, x2) and math.isclose(current_y, y2)):
-                            d = math.hypot(x2 - current_x, y2 - current_y)
-                            if d > 1e-6:
-                                e_pos += d * extrusion_per_mm
-                                gcode_lines.append(f"G1 X{x2:.3f} Y{y2:.3f} E{e_pos:.5f} F{feedrate}")
-                            current_x, current_y = x2, y2
+        perim_lines, e_pos = generate_perimeter_gcode(
+            polygons, z, z, e_pos, feedrate, extrusion_per_mm, travel_feed,
+            visualization_paths=visualization_paths)
+        gcode_lines.extend(perim_lines)
 
         # --- 2. Generate and Print Infill ---
         if infill_spacing > 0:
@@ -573,7 +534,9 @@ def generate_gcode_with_infill(z_levels, layer_polygons,
 def generate_gcode_6dof(z_levels, layer_polygons, direction,
                         feedrate=1500,
                         extrusion_per_mm=0.05,
-                        travel_feed=3000):
+                        travel_feed=3000,
+                        infill_spacing=2.0,
+                        infill_angle=45.0):
     """
     Generate G-code with ABC orientation commands for 6DOF printing.
     
@@ -584,6 +547,8 @@ def generate_gcode_6dof(z_levels, layer_polygons, direction,
       feedrate: Print feedrate in mm/min.
       extrusion_per_mm: Extrusion amount per mm of travel.
       travel_feed: Travel feedrate in mm/min.
+      infill_spacing: Spacing between infill lines (0 to disable).
+      infill_angle: Angle of infill lines in degrees.
       
     Returns:
       gcode_string: G-code with ABC orientation commands.
@@ -605,6 +570,7 @@ def generate_gcode_6dof(z_levels, layer_polygons, direction,
     roll_deg = np.degrees(roll)
     pitch_deg = np.degrees(pitch)
     yaw_deg = np.degrees(yaw)
+    orientation = (pitch_deg, roll_deg, yaw_deg)
     
     e_pos = 0.0
     gcode_lines = []
@@ -626,35 +592,27 @@ def generate_gcode_6dof(z_levels, layer_polygons, direction,
         gcode_lines.append(f"G1 A{pitch_deg:.2f} B{roll_deg:.2f} C{yaw_deg:.2f} F{travel_feed}")
         
         gcode_lines.append("; Perimeters")
-        for poly in polygons:
-            exterior_coords_2d = np.array(poly.exterior.coords)
-            if exterior_coords_2d.shape[0] >= 2:
-                z_col = np.full((exterior_coords_2d.shape[0], 1), z)
-                visualization_paths.append(np.hstack((exterior_coords_2d, z_col)))
-                
-                x0, y0 = exterior_coords_2d[0]
-                gcode_lines.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed}")
-                current_x, current_y = x0, y0
-                for i in range(1, exterior_coords_2d.shape[0]):
-                    x2, y2 = exterior_coords_2d[i]
-                    if not (math.isclose(current_x, x2) and math.isclose(current_y, y2)):
-                        d = math.hypot(x2 - current_x, y2 - current_y)
-                        if d > 1e-6:
-                            e_pos += d * extrusion_per_mm
-                            gcode_lines.append(f"G1 X{x2:.3f} Y{y2:.3f} A{pitch_deg:.2f} B{roll_deg:.2f} C{yaw_deg:.2f} E{e_pos:.5f} F{feedrate}")
-                        current_x, current_y = x2, y2
+        perim_lines, e_pos = generate_perimeter_gcode(
+            polygons, z, z, e_pos, feedrate, extrusion_per_mm, travel_feed,
+            orientation=orientation, visualization_paths=visualization_paths)
+        gcode_lines.extend(perim_lines)
+        
+        if infill_spacing > 0:
+            gcode_lines.append("; Infill")
+            layer_bounds = get_bounds_cached(polygons, cache_key=f"bounds_{z}")
+            infill_lines = generate_infill(polygons, infill_spacing, infill_angle, layer_bounds)
             
-            for interior in poly.interiors:
-                interior_coords_2d = np.array(interior.coords)
-                if interior_coords_2d.shape[0] >= 2:
-                    z_col = np.full((interior_coords_2d.shape[0], 1), z)
-                    visualization_paths.append(np.hstack((interior_coords_2d, z_col)))
+            for line_seg in infill_lines:
+                infill_coords_2d = np.array(line_seg.coords)
+                if infill_coords_2d.shape[0] >= 2:
+                    z_col = np.full((infill_coords_2d.shape[0], 1), z)
+                    visualization_paths.append(np.hstack((infill_coords_2d, z_col)))
                     
-                    x0, y0 = interior_coords_2d[0]
-                    gcode_lines.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed}")
+                    x0, y0 = infill_coords_2d[0]
+                    gcode_lines.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed} A{pitch_deg:.2f} B{roll_deg:.2f} C{yaw_deg:.2f}")
                     current_x, current_y = x0, y0
-                    for i in range(1, interior_coords_2d.shape[0]):
-                        x2, y2 = interior_coords_2d[i]
+                    for i in range(1, infill_coords_2d.shape[0]):
+                        x2, y2 = infill_coords_2d[i]
                         if not (math.isclose(current_x, x2) and math.isclose(current_y, y2)):
                             d = math.hypot(x2 - current_x, y2 - current_y)
                             if d > 1e-6:
@@ -669,9 +627,6 @@ def generate_gcode_6dof(z_levels, layer_polygons, direction,
     ]
     
     return "\n".join(gcode_lines), visualization_paths
-
-# ... (keep slice_mesh_to_polygons, generate_infill, helpers, and __main__ the same) ...
-
 
 
 # --- Main Execution (for command-line use) ---
