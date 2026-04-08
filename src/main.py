@@ -45,6 +45,7 @@ ACTOR_OVERHANG_TEXT = "overhang_text"
 ACTOR_FULL_PATHS = "slice_paths"
 ACTOR_LAYER_VIEW_PATHS = "layer_view_paths"
 ACTOR_LAYER_VIEW_MESH = "layer_view_mesh"
+ACTOR_ORIENT_ARROW = "orient_arrow"
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -265,7 +266,71 @@ class MainWindow(QMainWindow):
         self.layer_slider.setEnabled(False)
         self.layer_slider.valueChanged.connect(self._update_layer_view)
         l.addWidget(self.layer_slider)
-        parent_layout.addWidget(gb)
+        
+        # 6DOF Print Orientation Controls
+        gb_6dof = QGroupBox("6DOF Print Orientation")
+        l_6dof = QVBoxLayout(gb_6dof)
+        
+        # Input mode selector
+        h_input_mode = QHBoxLayout()
+        h_input_mode.addWidget(QLabel("Input:"))
+        self.input_mode_combo = QComboBox()
+        self.input_mode_combo.addItems(["Normal Vector", "Angles (Theta/Phi)"])
+        self.input_mode_combo.currentTextChanged.connect(self._update_6dof_input_mode)
+        h_input_mode.addWidget(self.input_mode_combo)
+        l_6dof.addLayout(h_input_mode)
+        
+        # Vector input (X, Y, Z components)
+        self.vector_input_widget = QWidget()
+        vector_grid = QGridLayout(self.vector_input_widget)
+        vector_grid.addWidget(QLabel("Normal X:"), 0, 0)
+        self.norm_x_sb = QDoubleSpinBox()
+        self.norm_x_sb.setRange(-1.0, 1.0); self.norm_x_sb.setSingleStep(0.1); self.norm_x_sb.setValue(0.0)
+        vector_grid.addWidget(self.norm_x_sb, 0, 1)
+        vector_grid.addWidget(QLabel("Normal Y:"), 1, 0)
+        self.norm_y_sb = QDoubleSpinBox()
+        self.norm_y_sb.setRange(-1.0, 1.0); self.norm_y_sb.setSingleStep(0.1); self.norm_y_sb.setValue(0.0)
+        vector_grid.addWidget(self.norm_y_sb, 1, 1)
+        vector_grid.addWidget(QLabel("Normal Z:"), 2, 0)
+        self.norm_z_sb = QDoubleSpinBox()
+        self.norm_z_sb.setRange(-1.0, 1.0); self.norm_z_sb.setSingleStep(0.1); self.norm_z_sb.setValue(1.0)
+        vector_grid.addWidget(self.norm_z_sb, 2, 1)
+        l_6dof.addWidget(self.vector_input_widget)
+        
+        # Angle input (Theta/Phi) - hidden by default
+        self.angle_input_widget = QWidget()
+        angle_grid = QGridLayout(self.angle_input_widget)
+        angle_grid.addWidget(QLabel("Theta (°):"), 0, 0)
+        self.theta_sb = QDoubleSpinBox()
+        self.theta_sb.setRange(0, 180); self.theta_sb.setSingleStep(5); self.theta_sb.setValue(0)
+        angle_grid.addWidget(self.theta_sb, 0, 1)
+        angle_grid.addWidget(QLabel("Phi (°):"), 1, 0)
+        self.phi_sb = QDoubleSpinBox()
+        self.phi_sb.setRange(0, 360); self.phi_sb.setSingleStep(5); self.phi_sb.setValue(0)
+        angle_grid.addWidget(self.phi_sb, 1, 1)
+        self.angle_input_widget.setVisible(False)
+        l_6dof.addWidget(self.angle_input_widget)
+        
+        # Apply and preview button
+        h_orient_btn = QHBoxLayout()
+        btn_apply_orient = QPushButton("Update Preview")
+        btn_apply_orient.clicked.connect(self._update_6dof_preview)
+        h_orient_btn.addWidget(btn_apply_orient)
+        l_6dof.addLayout(h_orient_btn)
+        
+        # Show orientation arrow checkbox
+        self.show_orient_arrow_cb = QCheckBox("Show Orientation Arrow")
+        self.show_orient_arrow_cb.setChecked(True)
+        self.show_orient_arrow_cb.stateChanged.connect(self._update_6dof_preview)
+        l_6dof.addWidget(self.show_orient_arrow_cb)
+        
+        # Slice for 6DOF button
+        btn_slice_6dof = QPushButton("Slice for 6DOF")
+        btn_slice_6dof.setMinimumHeight(40)
+        btn_slice_6dof.clicked.connect(self._slice_6dof)
+        l_6dof.addWidget(btn_slice_6dof)
+        
+        parent_layout.addWidget(gb_6dof)
 
     # --- Core Logic Methods ---
 
@@ -674,6 +739,122 @@ class MainWindow(QMainWindow):
             plane = pv.Plane(center=bed_center, direction=plane_normal, i_size=bed_x_size, j_size=bed_y_size, i_resolution=1, j_resolution=1)
             self.plotter.add_mesh(plane, name=ACTOR_PRINT_BED, color='lightblue', opacity=0.2)
         except Exception as e: print(f"Error drawing print bed: {e}")
+
+    def _update_6dof_input_mode(self, mode):
+        if mode == "Normal Vector":
+            self.vector_input_widget.setVisible(True)
+            self.angle_input_widget.setVisible(False)
+        else:
+            self.vector_input_widget.setVisible(False)
+            self.angle_input_widget.setVisible(True)
+
+    def _get_print_direction(self):
+        if self.input_mode_combo.currentText() == "Normal Vector":
+            nx = self.norm_x_sb.value()
+            ny = self.norm_y_sb.value()
+            nz = self.norm_z_sb.value()
+            direction = np.array([nx, ny, nz])
+        else:
+            theta = np.radians(self.theta_sb.value())
+            phi = np.radians(self.phi_sb.value())
+            direction = np.array([
+                np.sin(theta) * np.cos(phi),
+                np.sin(theta) * np.sin(phi),
+                np.cos(theta)
+            ])
+        norm = np.linalg.norm(direction)
+        if norm < 1e-6:
+            return np.array([0.0, 0.0, 1.0])
+        return direction / norm
+
+    def _update_6dof_preview(self):
+        self.plotter.remove_actor(ACTOR_ORIENT_ARROW, render=False)
+        if not self.show_orient_arrow_cb.isChecked():
+            self.plotter.render()
+            return
+        
+        if self.original_mesh is None:
+            return
+        
+        direction = self._get_print_direction()
+        
+        center = self.original_mesh.center
+        bounds = self.original_mesh.bounds
+        max_dim = max(bounds[3] - bounds[0], bounds[4] - bounds[1], bounds[5] - bounds[2])
+        arrow_length = max_dim * 0.5
+        
+        start = np.array(center)
+        end = start + direction * arrow_length
+        
+        arrow = pv.Arrow(start=start, direction=direction, scale=arrow_length)
+        self.plotter.add_mesh(arrow, color='yellow', line_width=4, name=ACTOR_ORIENT_ARROW)
+        self.plotter.render()
+        self.status.showMessage(f"Print direction: [{direction[0]:.3f}, {direction[1]:.3f}, {direction[2]:.3f}]")
+
+    def _slice_6dof(self):
+        if self.original_mesh is None:
+            self.status.showMessage("Load a model first."); return
+        
+        direction = self._get_print_direction()
+        
+        fn, _ = QFileDialog.getSaveFileName(self, "Save 6DOF G-code", "", "G-code Files (*.gcode)")
+        if not fn: return
+        if not fn.lower().endswith('.gcode'): fn += '.gcode'
+        
+        self.status.showMessage(f"Slicing at custom orientation..."); QApplication.processEvents()
+        
+        try:
+            import trimesh
+            tmp_stl_file = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as tmp:
+                    tmp_stl_file = tmp.name
+                    self.original_mesh.save(tmp_stl_file)
+                
+                layer_h = self.slice_layer_sb.value()
+                
+                from slicing import slicing
+                z_levels, layer_polygons = slicing.slice_mesh_to_polygons(tmp_stl_file, layer_h)
+                
+                if not z_levels or not layer_polygons:
+                    self.status.showMessage("Slicing returned no layers."); return
+                
+                ext_mm = self.slice_extrude_sb.value()
+                feed = self.slice_feed_sb.value()
+                travel = self.slice_travel_sb.value()
+                
+                gcode, paths = slicing.generate_gcode_6dof(
+                    z_levels, layer_polygons, 
+                    direction.tolist(),
+                    feedrate=feed, extrusion_per_mm=ext_mm,
+                    travel_feed=travel)
+                
+                with open(fn, "w") as f: f.write(gcode)
+                self.generated_slice_paths = paths
+                
+                self.max_layer_index = len(z_levels) - 1
+                self.slice_z_levels = z_levels
+                self.slice_layer_polygons = layer_polygons
+                
+                if self.max_layer_index >= 0:
+                    self.layer_slider.setEnabled(True)
+                    self.layer_slider.setMaximum(self.max_layer_index)
+                    self.layer_slider.blockSignals(True)
+                    self.layer_slider.setValue(self.max_layer_index)
+                    self.layer_slider.blockSignals(False)
+                    self._update_layer_view()
+                
+                self.status.showMessage(f"6DOF slice saved to {os.path.basename(fn)}")
+                self.update_display()
+                
+            finally:
+                if tmp_stl_file and os.path.exists(tmp_stl_file):
+                    try: os.remove(tmp_stl_file)
+                    except OSError: pass
+                    
+        except Exception as e:
+            self.status.showMessage(f"6DOF slicing error: {e}")
+            traceback.print_exc()
 
     def export_original(self):
         # (Identical to previous version)
