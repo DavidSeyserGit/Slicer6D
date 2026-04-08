@@ -221,9 +221,245 @@ def generate_infill(polygons, spacing, angle_degrees, bounds):
 
 
 
-# slicing.py
+def normalize_vector(v):
+    """Normalize a 3D vector to unit length."""
+    v = np.array(v, dtype=float)
+    norm = np.linalg.norm(v)
+    if norm < 1e-10:
+        raise ValueError("Vector magnitude too small")
+    return v / norm
 
-# ... (keep imports and other functions the same) ...
+
+def rotation_matrix_between_vectors(v_from, v_to):
+    """Create a rotation matrix that rotates v_from to align with v_to."""
+    v_from = normalize_vector(v_from)
+    v_to = normalize_vector(v_to)
+    
+    v = np.cross(v_from, v_to)
+    c = np.dot(v_from, v_to)
+    
+    if c > 0.9999:
+        return np.eye(3)
+    if c < -0.9999:
+        orth = np.array([1, 0, 0])
+        if abs(v_from[0]) > 0.9:
+            orth = np.array([0, 1, 0])
+        orth = normalize_vector(np.cross(v_from, orth))
+        return -np.eye(3) + 2 * np.outer(orth, orth)
+    
+    s = np.linalg.norm(v)
+    skew = np.array([
+        [0, -v[2], v[1]],
+        [v[2], 0, -v[0]],
+        [-v[1], v[0], 0]
+    ])
+    return np.eye(3) + skew + np.dot(skew, skew) * (1 - c) / (s * s)
+
+
+def eulerAnglesFromRotationMatrix(R):
+    """Extract Euler angles (A, B, C) in degrees from rotation matrix.
+    Returns angles for rotation around X (A), Y (B), Z (C) axes.
+    Applies rotation in order Z-Y-X (yaw, pitch, roll).
+    """
+    sy = math.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
+    singular = sy < 1e-6
+    
+    if not singular:
+        x = math.atan2(R[2, 1], R[2, 2])
+        y = math.atan2(-R[2, 0], sy)
+        z = math.atan2(R[1, 0], R[0, 0])
+    else:
+        x = math.atan2(-R[1, 2], R[1, 1])
+        y = math.atan2(-R[2, 0], sy)
+        z = 0
+    
+    return math.degrees(x), math.degrees(y), math.degrees(z)
+
+
+def slice_mesh_at_orientation(mesh, layer_height, print_direction):
+    """
+    Slice a mesh at an arbitrary orientation.
+
+    Args:
+        mesh: trimesh.Trimesh object
+        layer_height: float, layer thickness
+        print_direction: 3D vector (list or array) specifying the direction 
+                        the printer will print (becomes new Z-axis)
+
+    Returns:
+        Tuple (distances, layer_polygons) where:
+        - distances: list of distances along print direction
+        - layer_polygons: list of lists of shapely Polygon objects for each layer
+    """
+    print_direction = normalize_vector(print_direction)
+    z_axis = np.array([0, 0, 1])
+    
+    rot_matrix = rotation_matrix_between_vectors(print_direction, z_axis)
+    
+    original_vertices = mesh.vertices.copy()
+    original_faces = mesh.faces.copy()
+    
+    rotated_vertices = np.dot(original_vertices, rot_matrix.T)
+    
+    transformed_mesh = trimesh.Trimesh(vertices=rotated_vertices, faces=original_faces)
+    
+    bounds = np.array(transformed_mesh.bounds).flatten()
+    z_min, z_max = float(bounds[2]), float(bounds[5])
+    
+    start_z = z_min + layer_height / 2.0
+    num_layers = math.ceil((z_max - start_z) / layer_height)
+    if num_layers <= 0:
+        return [], []
+    
+    distances = np.arange(start_z, z_max, layer_height)
+    
+    all_layer_polygons = []
+    for i, z in enumerate(distances):
+        try:
+            section = transformed_mesh.section(plane_origin=[0, 0, z], plane_normal=[0, 0, 1])
+            if section is None or len(section.entities) == 0:
+                all_layer_polygons.append([])
+                continue
+            
+            try:
+                proj, _ = section.to_planar()
+            except Exception as e:
+                print(f"  Layer {i+1} at dist={z:.3f}: Projection error: {e}", file=sys.stderr)
+                all_layer_polygons.append([])
+                continue
+            
+            lines = []
+            for ent in proj.entities:
+                if hasattr(ent, 'points') and len(ent.points) >= 2:
+                    coords = proj.vertices[ent.points]
+                    if len(coords) >= 2:
+                        lines.append(LineString(coords))
+            
+            if not lines:
+                all_layer_polygons.append([])
+                continue
+            
+            merged = unary_union(lines)
+            polygons_on_layer = list(polygonize(merged))
+            
+            valid_polygons = []
+            for poly in polygons_on_layer:
+                if isinstance(poly, Polygon):
+                    cleaned_poly = poly.buffer(0)
+                    if cleaned_poly.is_valid and cleaned_poly.area > 1e-6:
+                        valid_polygons.append(cleaned_poly)
+            
+            all_layer_polygons.append(valid_polygons)
+            
+        except Exception as e:
+            print(f"  Layer {i+1} at dist={z:.3f}: Slicing error: {e}", file=sys.stderr)
+            all_layer_polygons.append([])
+    
+    return distances.tolist(), all_layer_polygons, rot_matrix
+
+
+def generate_gcode_6dof(distances, layer_polygons, rot_matrix,
+                       feedrate=1500,
+                       extrusion_per_mm=0.05,
+                       travel_feed=3000,
+                       infill_spacing=2.0,
+                       infill_angle=45.0):
+    """
+    Generate 6DOF G-code with ABC orientation commands.
+
+    Args:
+        distances: list of distances along print direction (slicing positions)
+        layer_polygons: list of lists of shapely Polygons for each layer
+        rot_matrix: 3x3 rotation matrix used for slicing (transforms print direction to Z)
+        feedrate: printing feedrate in mm/min
+        extrusion_per_mm: extrusion amount per mm of XY travel
+        travel_feed: travel moves feedrate in mm/min
+        infill_spacing: spacing between infill lines (0 to disable)
+        infill_angle: angle of infill lines in degrees
+
+    Returns:
+        String containing G-code with ABC orientation commands
+    """
+    e_pos = 0.0
+    gcode_lines = []
+    
+    a, b, c = eulerAnglesFromRotationMatrix(rot_matrix)
+    
+    gcode_lines += [
+        "; 6DOF Slicer G-code",
+        "; Print direction transformed to Z-axis",
+        f"; Orientation: A={a:.2f} B={b:.2f} C={c:.2f}",
+        "G90 ; Absolute positioning",
+        "G21 ; Millimeters",
+        f"G1 F{travel_feed} ; Set travel feed",
+        f"G1 A{a:.2f} B{b:.2f} C{c:.2f} ; Set orientation",
+    ]
+    
+    for layer_idx, (dist, polygons) in enumerate(zip(distances, layer_polygons)):
+        if not polygons:
+            continue
+        
+        gcode_lines.append(f"; Layer {layer_idx + 1} at distance {dist:.3f}")
+        gcode_lines.append(f"G1 Z{dist:.3f} F{travel_feed}")
+        
+        gcode_lines.append("; Perimeters")
+        for poly in polygons:
+            exterior_coords_2d = np.array(poly.exterior.coords)
+            if exterior_coords_2d.shape[0] >= 2:
+                x0, y0 = exterior_coords_2d[0]
+                gcode_lines.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed} A{a:.2f} B{b:.2f} C{c:.2f}")
+                current_x, current_y = x0, y0
+                for i in range(1, exterior_coords_2d.shape[0]):
+                    x2, y2 = exterior_coords_2d[i]
+                    if not (math.isclose(current_x, x2) and math.isclose(current_y, y2)):
+                        d = math.hypot(x2 - current_x, y2 - current_y)
+                        if d > 1e-6:
+                            e_pos += d * extrusion_per_mm
+                            gcode_lines.append(f"G1 X{x2:.3f} Y{y2:.3f} Z{dist:.3f} A{a:.2f} B{b:.2f} C{c:.2f} E{e_pos:.5f} F{feedrate}")
+                        current_x, current_y = x2, y2
+            
+            for interior in poly.interiors:
+                interior_coords_2d = np.array(interior.coords)
+                if interior_coords_2d.shape[0] >= 2:
+                    x0, y0 = interior_coords_2d[0]
+                    gcode_lines.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed} A{a:.2f} B{b:.2f} C{c:.2f}")
+                    current_x, current_y = x0, y0
+                    for i in range(1, interior_coords_2d.shape[0]):
+                        x2, y2 = interior_coords_2d[i]
+                        if not (math.isclose(current_x, x2) and math.isclose(current_y, y2)):
+                            d = math.hypot(x2 - current_x, y2 - current_y)
+                            if d > 1e-6:
+                                e_pos += d * extrusion_per_mm
+                                gcode_lines.append(f"G1 X{x2:.3f} Y{y2:.3f} Z{dist:.3f} A{a:.2f} B{b:.2f} C{c:.2f} E{e_pos:.5f} F{feedrate}")
+                            current_x, current_y = x2, y2
+        
+        if infill_spacing > 0:
+            gcode_lines.append("; Infill")
+            layer_bounds = get_bounds(polygons)
+            infill_lines = generate_infill(polygons, infill_spacing, infill_angle, layer_bounds)
+            
+            for line_seg in infill_lines:
+                infill_coords_2d = np.array(line_seg.coords)
+                if infill_coords_2d.shape[0] >= 2:
+                    x0, y0 = infill_coords_2d[0]
+                    gcode_lines.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed} A{a:.2f} B{b:.2f} C{c:.2f}")
+                    current_x, current_y = x0, y0
+                    for i in range(1, infill_coords_2d.shape[0]):
+                        x2, y2 = infill_coords_2d[i]
+                        if not (math.isclose(current_x, x2) and math.isclose(current_y, y2)):
+                            d = math.hypot(x2 - current_x, y2 - current_y)
+                            if d > 1e-6:
+                                e_pos += d * extrusion_per_mm
+                                gcode_lines.append(f"G1 X{x2:.3f} Y{y2:.3f} Z{dist:.3f} A{a:.2f} B{b:.2f} C{c:.2f} E{e_pos:.5f} F{feedrate}")
+                            current_x, current_y = x2, y2
+    
+    gcode_lines += [
+        "G1 Z5 F5000 ; Lift",
+        "M84 ; Disable steppers",
+        "; End of 6DOF G-code",
+    ]
+    
+    return "\n".join(gcode_lines)
 
 def generate_gcode_with_infill(z_levels, layer_polygons,
                                feedrate=1500,
